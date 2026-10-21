@@ -29,8 +29,8 @@ export function makeGrokBotDriver(input, options = {}, dependencies = {}) {
     auth: {
       provider: ID,
       methods: [
-        { type: "oauth", label: "Drive the installed Grok Bot desktop app (default; zero credential)", authorize: () => cdp.authorize() },
-        { type: "oauth", label: "Direct Connect protocol (reads the app's local sign-in)", async authorize() {
+        { type: "oauth", label: "Drive the installed Grok Bot desktop app (default; macOS and Windows; zero credential)", authorize: () => cdp.authorize() },
+        { type: "oauth", label: "Direct Connect protocol (Windows only; reads the app's local sign-in)", async authorize() {
           try {
             const flow = await (await driverFor("direct")).authorize()
             return { ...flow, callback: async (...args) => { const result = await flow.callback(...args); return result.type === "success" ? { ...result, mechanism: "direct" } : result } }

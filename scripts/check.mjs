@@ -1,12 +1,15 @@
-// Shape gate for magpie-cloud-agents. Loads index.mjs exactly as the host
-// does and checks the shape of what each plugin function returns: the
-// assertions the community gate enforces (auth.provider, auth.loader,
-// non-empty auth.methods with authorize on every oauth entry, config
-// producing npm + non-empty models) plus, for this package, the six
-// expected provider ids with their display names and static models, and
-// the no-helper-export rule (S1: an exported helper is invoked as a plugin
-// and its throw poisons the load — internals hang off `_internal`).
-// It signs in to nothing and sends no request.
+// Shape gate for magpie-grok-bot. Loads index.mjs exactly as the host does and
+// checks what the plugin function returns: the assertions the community gate
+// enforces (auth.provider, auth.loader, non-empty auth.methods with authorize on
+// every oauth entry, config producing npm + non-empty models) plus the expected
+// provider id, display name and static model, and the no-helper-export rule (an
+// exported helper is invoked as a plugin and its throw poisons the load —
+// internals hang off `_internal`).
+//
+// With --stubs, every child-process, fetch and WebSocket entry point is replaced
+// by a sentinel and the provider is driven with an isolated app fixture: its
+// sign-in reports the missing install, and its transport answers with the same
+// 502 without touching the app. It signs in to nothing and sends no request.
 
 import childProcess from "node:child_process"
 import { syncBuiltinESMExports } from "node:module"
@@ -14,31 +17,6 @@ import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 const EXPECTED = {
-  CodexCloudPlugin: {
-    id: "codex-cloud",
-    name: "Codex Cloud (codex CLI)",
-    models: { "cloud-task": "Codex Cloud task" },
-  },
-  CodexAgentsPlugin: {
-    id: "codex-agents",
-    name: "Codex Agents API",
-    models: { "gpt-6-astra": "GPT-6 Astra" },
-  },
-  CursorCloudPlugin: {
-    id: "cursor-cloud",
-    name: "Cursor Cloud Agents",
-    models: { "composer-2": "Composer 2", "claude-sonnet-4-5": "Claude Sonnet 4.5" },
-  },
-  DevinCloudPlugin: {
-    id: "devin-cloud",
-    name: "Devin Cloud",
-    models: { "devin-session": "Devin session" },
-  },
-  DotsPlugin: {
-    id: "dots",
-    name: "ChatGPT Dot",
-    models: { dot: "ChatGPT Dot (replies in minutes)" },
-  },
   GrokBotPlugin: {
     id: "grok-bot",
     name: "Grok Bot (xAI desktop)",
@@ -48,28 +26,9 @@ const EXPECTED = {
 
 const root = fileURLToPath(new URL("..", import.meta.url))
 const problems = []
-// Sandbox accounting under --stubs uses two counters, not one. sandboxOperations
-// counts a covered operation attempted from a provider's transport;
-// authorizeOperations counts one attempted inside an OAuth authorization probe.
-// Every transport attempt is fatal below regardless of how the provider was
-// classified. An authorization-probe attempt is fatal only for a provider
-// positively classified as a scaffold; for any other provider it is counted and
-// reported in the summary line instead. The reason for the exemption: the real
-// codex-cloud callback legitimately invokes its CLI verification, so the
-// sentinels must block that attempt rather than count it against the transport
-// path — without the exemption a green composed tree fails. The exemption is
-// about attempts and never about outcomes: the sentinels stay installed inside
-// the probe, so the attempted call never runs, and the callback's claimed
-// outcome is still asserted by the OAuth clauses below. What the exemption
-// cannot catch: it turns a non-scaffold provider's authorization attempt into a
-// reported count rather than an assertion, so an implementation probing from its
-// authorize region passes the gate with the attempt visible only in the summary
-// line.
 let sandboxOperations = 0
-let authorizeOperations = 0
-let probingAuthorization = false
 if (process.argv.includes("--stubs")) {
-  const forbidden = () => { if (probingAuthorization) authorizeOperations++; else sandboxOperations++; throw new Error("sandbox gate attempted external access") }
+  const forbidden = () => { sandboxOperations++; throw new Error("sandbox gate attempted external access") }
   for (const key of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) childProcess[key] = forbidden
   syncBuiltinESMExports()
   globalThis.fetch = forbidden
@@ -97,6 +56,30 @@ const client = {
   config: { get: async () => ({ data: {} }) },
 }
 
+async function isolatedGrokBot() {
+  const { makeGrokBotDriver } = await import(pathToFileURL(join(root, "providers/grok-bot.mjs")).href)
+  const { CDP_ERRORS } = await import(pathToFileURL(join(root, "providers/grok-bot-cdp.mjs")).href)
+  let operations = 0
+  const forbidden = () => { operations++; throw new Error("implemented gate attempted app access") }
+  const isolated = makeGrokBotDriver({}, { grokBot: { persistSessions: false } }, {
+    cdp: { env: {}, exists: async () => false, readFile: forbidden, execFile: forbidden, processes: forbidden, spawn: forbidden, fetch: forbidden, freePort: forbidden, connect: forbidden },
+    importDirect: async () => { throw new Error("fixture missing direct module") },
+  })
+  for (const method of isolated.auth.methods) {
+    const shape = await method.authorize({ env: "sandbox" })
+    if (shape.method !== "auto" || typeof shape.callback !== "function") throw new Error("malformed OAuth flow")
+  }
+  const flow = await isolated.auth.methods[0].authorize()
+  const result = await flow.callback()
+  if (result.type !== "failed" || result.error !== CDP_ERRORS.missing) throw new Error("implemented missing-install contract failed")
+  if (Object.keys(await isolated.auth.loader(async () => null)).length) throw new Error("signed-out loader is active")
+  const loader = await isolated.auth.loader(async () => ({ type: "oauth", access: "app-local", mechanism: "cdp" }))
+  const response = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "app-bot", messages: [{ role: "user", content: "gate" }] }) })
+  if (response.status !== 502 || response.headers.get("X-Magpie-Sign-In") !== "kept" || (await response.json()).error.message !== result.error) throw new Error("implemented transport error contract failed")
+  if ((await (await isolated.auth.methods[1].authorize()).callback()).type !== "failed" || operations !== 0) throw new Error("implemented transport isolation failed")
+  console.log("implemented: grok-bot; app operations: 0")
+}
+
 for (const [fnName, fn] of Object.entries(mod)) {
   if (typeof fn !== "function") continue
   const want = EXPECTED[fnName]
@@ -116,67 +99,7 @@ for (const [fnName, fn] of Object.entries(mod)) {
       if (!["oauth", "api"].includes(m.type)) problems.push(`${fnName}: method type ${m.type}`)
       if (m.type === "oauth" && typeof m.authorize !== "function") problems.push(`${fnName}: ${m.label} has no authorize`)
     }
-    if (process.argv.includes("--stubs") && auth.provider === "grok-bot") {
-      const { makeGrokBotDriver } = await import("../providers/grok-bot.mjs")
-      let operations = 0
-      const forbidden = () => { operations++; throw new Error("implemented gate attempted app access") }
-      const isolated = makeGrokBotDriver({}, {}, { cdp: { env: {}, exists: async () => false, processes: forbidden, spawn: forbidden, fetch: forbidden, freePort: forbidden }, importDirect: async () => { throw new Error("fixture missing direct module") } })
-      for (const method of isolated.auth.methods) {
-        const shape = await method.authorize({ env: "sandbox" })
-        if (shape.method !== "auto" || typeof shape.callback !== "function") throw new Error("malformed OAuth flow")
-      }
-      const flow = await isolated.auth.methods[0].authorize()
-      const result = await flow.callback()
-      if (result.type !== "failed" || result.error !== "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry") throw new Error("implemented missing-install contract failed")
-      if (Object.keys(await isolated.auth.loader(async () => null)).length) throw new Error("signed-out loader is active")
-      const loader = await isolated.auth.loader(async () => ({ type: "oauth", access: "app-local", mechanism: "cdp" }))
-      const response = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "app-bot", messages: [{ role: "user", content: "gate" }] }) })
-      if (response.status !== 502 || response.headers.get("X-Magpie-Sign-In") !== "kept" || (await response.json()).error.message !== result.error) throw new Error("implemented transport error contract failed")
-      if ((await (await isolated.auth.methods[1].authorize()).callback()).type !== "failed" || operations !== 0) throw new Error("implemented transport isolation failed")
-      console.log("implemented: grok-bot; scaffold: 5 candidates checked by sandbox behavior; app operations: 0")
-    } else if (process.argv.includes("--stubs")) {
-      const credential = auth.methods[0].type === "api" ? { type: "api", key: "sandbox-only" } : { type: "oauth", env: "sandbox" }
-      const loader = await auth.loader(async () => credential)
-      let scaffold
-      if (typeof loader.fetch !== "function") {
-        if (Object.keys(loader).length || Object.keys(await auth.loader(async () => null)).length) throw new Error("invalid signed-out loader")
-        console.log(`sandbox: ${auth.provider}; incomplete credential refused`)
-      } else {
-        for (const stream of [false, true]) {
-          const response = await loader.fetch(new Request(loader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ messages: null, stream }) }))
-          const answer = await response.json()
-          const isScaffold = response.status === 501 && answer.error?.message?.includes(auth.provider) && answer.error.message.includes("transport not implemented yet")
-          const invalidRequest = response.status === 400 && response.headers.get("X-Magpie-Sign-In") === "kept" && answer.error?.code === 400 && answer.error?.type === "cloud_agent_error" && answer.error?.message === "a request that isn't JSON or has no valid messages array"
-          if (!isScaffold && !invalidRequest) throw new Error("invalid sandbox response")
-          if (scaffold !== undefined && scaffold !== isScaffold) throw new Error("inconsistent sandbox contract")
-          scaffold = isScaffold
-        }
-        console.log(`sandbox: ${auth.provider}; ${scaffold ? "scaffold" : "invalid request refused"}`)
-      }
-      for (const method of auth.methods) {
-        if (method.type !== "oauth") continue
-        let outcome
-        // The flag scopes the sentinel branch to this authorization probe only;
-        // the finally below clears it so a later provider's transport attempt is
-        // counted as fatal, never exempt.
-        probingAuthorization = scaffold !== true
-        try {
-          const flow = await method.authorize({ env: "sandbox" })
-          if (flow.method !== "auto" || typeof flow.callback !== "function") throw new Error("malformed OAuth flow")
-          outcome = await flow.callback()
-        } finally { probingAuthorization = false }
-        if (scaffold && outcome?.type !== "failed") throw new Error("stub claims successful authorization")
-        if (!["failed", "success"].includes(outcome?.type)) throw new Error("invalid OAuth outcome")
-        if (outcome.type === "success") {
-          const authenticated = await auth.loader(async () => ({ ...outcome, type: "oauth" }))
-          if (typeof authenticated.fetch !== "function") throw new Error("authorization success has no transport")
-          const response = await authenticated.fetch(new Request(authenticated.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: "gate" }], stream: false }) }))
-          const answer = await response.json()
-          if (response.status === 501 || response.status === 400 || response.status === 401 || answer.error?.message?.includes("transport not implemented yet")) throw new Error("authorization success is unsupported by transport")
-        }
-        console.log(`authorization: ${auth.provider}; ${outcome.type}`)
-      }
-    }
+    if (process.argv.includes("--stubs") && auth.provider === "grok-bot") await isolatedGrokBot()
     if (!hooks.config) {
       problems.push(`${fnName}: no config hook`)
       continue
@@ -204,19 +127,12 @@ for (const [fnName, fn] of Object.entries(mod)) {
   }
 }
 
-const missingIds = Object.values(EXPECTED)
-  .map((w) => w.id)
-  .filter((id) => !ids.includes(id))
+const missingIds = Object.values(EXPECTED).map(w => w.id).filter(id => !ids.includes(id))
 if (missingIds.length) problems.push(`provider ids missing: ${missingIds.join(", ")}`)
-
-// The summary label "transport attempts" is narrower than the counter it prints:
-// a scaffold's authorize-region attempt also lands in sandboxOperations (the
-// flag above is false for a scaffold). Only sandboxOperations is fatal;
-// authorizeOperations is reported, never asserted.
-if (process.argv.includes("--stubs")) console.log(`sandbox summary: transport attempts: ${sandboxOperations}; authorization attempts blocked: ${authorizeOperations}`)
+if (process.argv.includes("--stubs")) console.log(`sandbox summary: external operations: ${sandboxOperations}`)
 if (sandboxOperations) problems.push(`sandbox isolation failed: ${sandboxOperations} external operations`)
 if (problems.length) {
-  console.error(`✗ magpie-cloud-agents\n  ${problems.join("\n  ")}`)
+  console.error(`✗ magpie-grok-bot\n  ${problems.join("\n  ")}`)
   process.exit(1)
 }
-console.log(`✓ magpie-cloud-agents (${ids.length} providers: ${ids.join(", ")})`)
+console.log(`✓ magpie-grok-bot (${ids.length} provider: ${ids.join(", ")})`)
