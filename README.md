@@ -82,7 +82,7 @@ Each Grok Bot bot has one continuous chat, so a Magpie conversation becomes a **
 How the plugin keeps track:
 
 - **Conversation key.** A conversation is identified by Magpie's session ID (passed through the `x-magpie-cloud-agents-session` header). Without a session ID, it falls back to the model and the first user message.
-- **Marker.** Every prompt ends with a short marker, `[magpie <tag>.<turn>.<hash>]`. The hash covers the conversation's user messages up to that turn, which lets the plugin match the reply to its prompt and detect retries.
+- **Marker.** Every prompt ends with a short marker, `[magpie <tag>.<turn>.<hash>]`. The hash covers the conversation's user messages up to that turn, which lets the plugin match the reply to its prompt and detect retries. Set `grokBot.marker` to `false` to leave it out: the plugin then finds your message by its text, after the chat position it was sent at (falling back to the newest user message there). Retries still reattach when the conversation store has the turn, but a conversation can no longer be recovered from the chat after its store entry is lost; it gets a one-time catch-up instead.
 - **Store.** Delivered turns are recorded in `~/Library/Application Support/Magpie/grok-bot/conversations.json` (`grokBot.stateDir`). The file is private (mode 600) and written atomically. It holds only hashes, tags and bot ids, never message text. Entries expire after 30 days, and at most 500 are kept.
 - **Restarts.** Because the store is on disk, a conversation continues correctly after Magpie restarts. If the store is lost, the plugin looks for the conversation's markers in the bot's chat and continues from the last one whose hash matches.
 - **Bot pinning.** A conversation stays with the bot it started on, even if you select another bot in the app later. Picking a different bot's model starts a catch-up segment in that bot.
@@ -90,7 +90,7 @@ How the plugin keeps track:
 
 ### What appears in your Grok Bot account
 
-Messages are typed into the app as you. They appear in the bot's chat and on your account like anything you type yourself, including the header line and the `[magpie …]` markers.
+Messages are typed into the app as you. They appear in the bot's chat and on your account like anything you type yourself, including the header line and the `[magpie …]` markers (unless you turn them off with `grokBot.sessionHeader` and `grokBot.marker`).
 
 ## Options
 
@@ -110,6 +110,7 @@ Set options with `magpie plugin options github:keizman/magpie-grok-bot '<json>'`
 | `grokBot.persistSessions` | `true` | Set to `false` to keep the conversation store in memory only |
 | `grokBot.systemPrompt` | `"first"` | `"first"` sends the system prompt once per conversation; `"never"` doesn't send it |
 | `grokBot.sessionHeader` | `true` | Set to `false` to leave out the "New conversation" header line |
+| `grokBot.marker` | `true` | Set to `false` to leave out the `[magpie …]` line at the end of each prompt (see Marker above) |
 | `grokBot.keepAliveMinutes` | `1` | Idle minutes before Magpie disconnects (and, with `"managed"`, closes its window) |
 | `grokBot.launchTimeoutMs` / `grokBot.appBootMs` | `10000` / `15000` | How long launch and page start may take |
 | `grokBot.settleMs` | `1500` | Unchanged-text interval that ends a reply |

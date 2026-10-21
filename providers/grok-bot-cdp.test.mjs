@@ -26,11 +26,17 @@ function fakeApp(settings = {}) {
   }
   const listeners = new Map()
   let PAGE
-  function read(marker) {
+  function read(target) {
     const rows = state.chats[state.selected] ?? []
+    const norm = value => String(value ?? "").replace(/\s+/g, " ").trim()
     let mine = -1
-    rows.forEach((row, index) => { if (row.role === "user" && marker && row.text.includes(marker)) mine = index })
-    const out = { selected: state.selected, found: mine >= 0, markers: rows.filter(row => row.role === "user").map(row => row.text).join("\n").match(MARKER) ?? [], texts: [], streaming: false, working: false, failed: false, after: 0, userAfter: false }
+    if (typeof target === "string") rows.forEach((row, index) => { if (row.role === "user" && target && row.text.includes(target)) mine = index })
+    else if (target) {
+      const users = rows.map((row, index) => index).filter(index => rows[index].role === "user" && index >= (target.from ?? 0))
+      const exact = users.filter(index => norm(rows[index].text).includes(norm(target.text)))
+      mine = (target.last ? exact.at(-1) : exact[0] ?? (target.loose ? users.at(-1) : undefined)) ?? -1
+    }
+    const out = { selected: state.selected, found: mine >= 0, at: mine >= 0 ? mine : null, next: rows.length, markers: rows.filter(row => row.role === "user").map(row => row.text).join("\n").match(MARKER) ?? [], texts: [], streaming: false, working: false, failed: false, after: 0, userAfter: false }
     if (mine < 0) return out
     for (const row of rows.slice(mine + 1)) {
       if (row.role === "user") { out.userAfter = true; break }
@@ -380,6 +386,45 @@ test("without a stored record the chat's own markers recover the conversation", 
   await chat(second, [user("remember 4721"), bot("ok"), user("which number?")])
   expect(app.state.sent[1].text.startsWith("which number?\n\n[magpie ")).toBe(true)
   expect(app.state.sent[1].text.match(/\[magpie ([0-9a-f]{8})/)[1]).toBe(app.state.sent[0].text.match(/\[magpie ([0-9a-f]{8})/)[1])
+})
+
+test("marker false sends prompts without the [magpie …] line and still streams each turn", async () => {
+  let count = 0
+  const { app, plugin } = harness({ reply: () => [`reply `, `${++count}`] }, { marker: false, sessionHeader: false })
+  const first = await chat(plugin, [user("remember 4721")])
+  const second = await chat(plugin, [user("remember 4721"), bot(first.text), user("which number?")])
+  expect(first.text).toBe("reply 1")
+  expect(second.text).toBe("reply 2")
+  expect(second.content.length).toBeGreaterThan(1)
+  expect(app.state.sent.map(row => row.text)).toEqual(["remember 4721", "which number?"])
+})
+
+test("marker false tells a repeated prompt apart by where it was sent", async () => {
+  let count = 0
+  const { app, plugin } = harness({ reply: () => [`part ${++count}`] }, { marker: false, sessionHeader: false })
+  const history = [user("continue")]
+  const first = await chat(plugin, history)
+  const second = await chat(plugin, [...history, bot(first.text), user("continue")])
+  expect(first.text).toBe("part 1")
+  expect(second.text).toBe("part 2")
+  expect(app.state.sent).toHaveLength(2)
+})
+
+test("marker false reattaches a retried turn without typing it twice", async () => {
+  const { app, plugin } = harness({ reply: () => ["first reply"] }, { marker: false })
+  await chat(plugin, [user("hello")])
+  const again = await chat(plugin, [user("hello")])
+  expect(again.text).toBe("first reply")
+  expect(app.state.sent).toHaveLength(1)
+})
+
+test("marker false without a stored record falls back to a one-time catch-up", async () => {
+  const { app, plugin, restart } = harness({}, { marker: false })
+  await chat(plugin, [user("remember 4721")])
+  const second = restart({ persistSessions: false, stateDir: mkdtempSync(join(tmpdir(), "grok-cdp-empty-")) })
+  await chat(second, [user("remember 4721"), bot("ok"), user("which number?")])
+  expect(app.state.sent[1].text).toContain("Current request:\nwhich number?")
+  expect(app.state.sent[1].text).not.toMatch(MARKER)
 })
 
 test("a conversation stays pinned to its bot when the app selection changes", async () => {

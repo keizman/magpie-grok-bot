@@ -49,13 +49,14 @@ export const LAUNCH_FLAGS = ["--disable-renderer-backgrounding", "--disable-back
 
 // Runs inside the app page. Text comes from the React props of each reply (the markdown source as it streams), falling back to the rendered text.
 const PAGE = String.raw`(selectors) => {
-  const VERSION = 3;
+  const VERSION = 4;
   let S = window.__magpieGrok;
   if (!S || S.version !== VERSION) {
     S = { version: VERSION, watchers: new Map() };
     const all = (root, selector) => { if (!selector) return []; try { return [...root.querySelectorAll(selector)]; } catch { return []; } };
     const matches = (element, selector) => { if (!selector) return false; try { return element.matches(selector); } catch { return false; } };
     const text = element => String(element?.innerText ?? element?.textContent ?? "").replace(/\u00a0/g, " ");
+    const norm = value => String(value ?? "").replace(/\s+/g, " ").trim();
     const visible = element => !!element && element.getClientRects().length > 0;
     S.source = element => {
       const key = Object.keys(element).find(name => name.startsWith("__reactFiber$"));
@@ -74,13 +75,21 @@ const PAGE = String.raw`(selectors) => {
     };
     S.isUser = row => matches(row, S.sel.userRow) || all(row, S.sel.userRow).length > 0;
     S.selected = () => document.querySelector(S.sel.selectedBot)?.getAttribute("data-agent-id") ?? null;
-    S.read = marker => {
+    // A target is either a marker string, or (with markers off) an anchor: the prompt text plus the chat position it was sent at.
+    S.read = target => {
       const rows = S.rows();
       const chat = S.chat();
+      const position = (row, order) => { const index = Number(row.dataset?.index); return Number.isFinite(index) ? index : order; };
       let mine = -1;
-      rows.forEach((row, index) => { if (S.isUser(row) && marker && text(row).includes(marker)) mine = index; });
+      if (typeof target === "string") rows.forEach((row, index) => { if (S.isUser(row) && target && text(row).includes(target)) mine = index; });
+      else if (target && typeof target === "object") {
+        const want = norm(target.text);
+        const users = rows.map((row, index) => index).filter(index => S.isUser(rows[index]) && position(rows[index], index) >= (Number(target.from) || 0));
+        const exact = want ? users.filter(index => norm(text(rows[index])).includes(want)) : [];
+        mine = (target.last ? exact.at(-1) : exact[0] ?? (target.loose ? users.at(-1) : undefined)) ?? -1;
+      }
       const users = rows.filter(S.isUser).map(text).join("\n");
-      const out = { selected: S.selected(), found: mine >= 0, markers: users.match(/\[magpie [0-9a-f]{8}\.\d+\.[0-9a-f]{6}\]/g) ?? [], texts: [], streaming: false, working: false, failed: false, after: 0, userAfter: false, rows: rows.length };
+      const out = { selected: S.selected(), found: mine >= 0, at: mine >= 0 ? position(rows[mine], mine) : null, next: rows.length ? Math.max(...rows.map(position)) + 1 : 0, markers: users.match(/\[magpie [0-9a-f]{8}\.\d+\.[0-9a-f]{6}\]/g) ?? [], texts: [], streaming: false, working: false, failed: false, after: 0, userAfter: false, rows: rows.length };
       if (mine < 0) return out;
       if (matches(rows[mine], S.sel.busyRow)) out.working = true;
       if (matches(rows[mine], S.sel.failedRow)) out.failed = true;
@@ -137,13 +146,13 @@ const PAGE = String.raw`(selectors) => {
     };
     S.draft = () => { const composer = S.composer(); return composer ? String(composer.value ?? text(composer)) : null; };
     S.signedOut = () => !!(S.sel.signIn && document.querySelector(S.sel.signIn));
-    S.watch = (id, marker, binding) => {
+    S.watch = (id, target, binding) => {
       S.unwatch(id);
       let last = "", queued = false, ranAt = 0, timer = null;
       const push = () => {
         queued = false; timer = null; ranAt = Date.now();
         let payload;
-        try { payload = JSON.stringify({ id, snapshot: S.read(marker) }); } catch (error) { payload = JSON.stringify({ id, error: String(error?.message ?? error) }); }
+        try { payload = JSON.stringify({ id, snapshot: S.read(target) }); } catch (error) { payload = JSON.stringify({ id, error: String(error?.message ?? error) }); }
         if (payload === last) return;
         last = payload;
         try { window[binding](payload); } catch {}
@@ -205,6 +214,11 @@ const botList = value => {
     return typeof id === "string" && id ? [{ id, name: typeof row === "object" ? row?.name ?? row?.displayName ?? row?.title : undefined }] : []
   }) : []
 }
+
+const norm = value => String(value ?? "").replace(/\s+/g, " ").trim()
+const targetOf = run => run.anchor ?? run.marker
+// Whether the composer still holds this prompt: by its marker, or with markers off by the prompt's tail.
+const holds = (draft, run) => typeof draft === "string" && (run.marker ? draft.includes(run.marker) : !!norm(run.prompt) && norm(draft).includes(norm(run.prompt).slice(-80)))
 
 const DEFAULTS = { settleMs: 1500, stuckMs: 120000, emptyMs: 20000, sentMs: 8000, selectMs: 8000, streamPollMs: 150, botsMs: 5000 }
 
@@ -291,7 +305,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     }
   }
   async function read(client, run, signal) {
-    try { return await page(client, `read(${JSON.stringify(run.marker)})`, signal) }
+    try { return await page(client, `read(${JSON.stringify(targetOf(run))})`, signal) }
     catch (error) { signal?.throwIfAborted(); if (!client.open) throw failure("crashed"); if (error.bridge) throw failure("changed"); throw error }
   }
   async function submit(client, run, signal) {
@@ -301,20 +315,25 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     if (!focus?.ok) throw failure("changed")
     await client.call("Input.insertText", { text: run.prompt }, signal)
     const draft = await page(client, "draft()", signal)
-    if (typeof draft !== "string" || !draft.includes(run.marker)) throw failure("changed")
+    if (!holds(draft, run)) throw failure("changed")
     for (const type of ["keyDown", "keyUp"]) await client.call("Input.dispatchKeyEvent", { type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 }, signal)
     const deadline = now() + setting("sentMs")
     for (;;) {
       const snapshot = await read(client, run, signal)
       if (snapshot.found) return
       const left = await page(client, "draft()", signal)
-      if (typeof left === "string" && !left.includes(run.marker) && now() >= deadline) return
+      if (typeof left === "string" && !holds(left, run) && now() >= deadline) return
       if (now() >= deadline) throw chatError(502, "Grok Bot didn't accept the prompt — it is still in the composer; check the Grok Bot window")
       await wait(150, signal)
     }
   }
 
   function compose(request, plan, tag, hashes) {
+    const composed = composeMarked(request, plan, tag, hashes)
+    if (options.marker !== false) return composed
+    return { marker: null, prompt: composed.prompt.slice(0, -(composed.marker.length + 2)) }
+  }
+  function composeMarked(request, plan, tag, hashes) {
     const texts = userTexts(request.messages)
     const last = hashes.length - 1
     const marker = markerOf(tag, last, hashes[last])
@@ -362,9 +381,17 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
       const segment = plan.segment
       const tag = segment?.tag ?? (session && !store.get(key)?.segments?.some(row => row.tag === baseTag(key)) ? baseTag(key) : freshTag())
       Object.assign(run, compose(request, plan, tag, hashes), { tag, plan: plan.kind, ref: `${run.bot.name} · ${plan.kind} ${tag}` })
-      const snapshot = await read(client, run, signal)
-      if (snapshot.found) run.reattached = true
-      else await submit(client, run, signal)
+      if (run.marker) {
+        const snapshot = await read(client, run, signal)
+        if (snapshot.found) run.reattached = true
+        else await submit(client, run, signal)
+      } else {
+        // Without markers a reply is found by prompt text after the position it was sent at; only a stored retry
+        // looks back through the whole chat for the prompt it already delivered.
+        const probe = await read(client, { anchor: { text: run.prompt, from: 0, last: true } }, signal)
+        if (plan.kind === "retry" && probe.found) { run.anchor = { text: run.prompt, from: probe.at }; run.reattached = true }
+        else { run.anchor = { text: run.prompt, from: probe.next ?? 0, loose: true }; await submit(client, run, signal) }
+      }
       run.sentAt = now()
       run.changedAt = run.sentAt
       run.busyAt = run.sentAt
@@ -415,7 +442,7 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     })
     let watching = false
     try {
-      if (client.bound && unsubscribe) watching = await page(client, `watch(${JSON.stringify(run.id)}, ${JSON.stringify(run.marker)}, ${JSON.stringify(BINDING)})`, signal).catch(() => false)
+      if (client.bound && unsubscribe) watching = await page(client, `watch(${JSON.stringify(run.id)}, ${JSON.stringify(targetOf(run))}, ${JSON.stringify(BINDING)})`, signal).catch(() => false)
       const interval = watching ? 1000 : setting("streamPollMs") || DEFAULTS.streamPollMs
       let lastProgress
       for (;;) {

@@ -24,7 +24,7 @@ function validateOptions(options) {
   }
   if (settings.streamPollMs != null) number(settings.streamPollMs, "grokBot.streamPollMs")
   if (settings.reattachPorts != null && (!Array.isArray(settings.reattachPorts) || settings.reattachPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535))) invalid("grokBot.reattachPorts", "an array of ports from 1 to 65535")
-  for (const key of ["ghostMode", "bringToFront", "sessionHeader", "persistSessions", "restartApp"]) boolean(settings[key], `grokBot.${key}`)
+  for (const key of ["ghostMode", "bringToFront", "sessionHeader", "persistSessions", "restartApp", "marker"]) boolean(settings[key], `grokBot.${key}`)
   if (settings.profile != null && !["app", "managed"].includes(settings.profile)) invalid("grokBot.profile", `"app" or "managed"`)
   for (const key of ["appPath", "stateDir", "profileDir"]) if (settings[key] != null) text(settings[key], `grokBot.${key}`)
   if (settings.systemPrompt != null && !["first", "never"].includes(settings.systemPrompt)) invalid("grokBot.systemPrompt", `"first" or "never"`)
