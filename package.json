@@ -1,7 +1,7 @@
 {
-  "name": "magpie-cloud-agents",
+  "name": "magpie-grok-bot",
   "version": "0.1.0",
-  "description": "Six vendor cloud agents as Magpie providers: OpenAI Codex Cloud and the Codex Agents API, Cursor Cloud Agents, Devin Cloud, ChatGPT Dots, and the Grok Bot desktop app.",
+  "description": "Grok Bot desktop app as a Magpie provider: drives the installed app on macOS (and Windows) with streamed replies and one Grok Bot session per Magpie conversation.",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
@@ -13,29 +13,30 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "bun test",
-    "check": "bun scripts/check.mjs"
+    "test": "bun scripts/test.mjs",
+    "check": "bun scripts/check.mjs",
+    "smoke": "node scripts/smoke-test.mjs"
   },
   "keywords": [
     "magpie",
     "magpie-plugin",
-    "cloud-agents",
-    "codex",
-    "cursor",
-    "devin",
-    "chatgpt",
-    "dots",
-    "grok"
+    "opencode",
+    "opencode-plugin",
+    "grok",
+    "grok-bot",
+    "xai",
+    "desktop-app",
+    "macos"
   ],
   "license": "MIT",
-  "author": "magpie-cloud-agents contributors",
+  "author": "magpie-grok-bot contributors",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/guanwenpeng2001-bot/magpie-cloud-agents.git"
+    "url": "git+https://github.com/keizman/magpie-grok-bot.git"
   },
-  "homepage": "https://github.com/guanwenpeng2001-bot/magpie-cloud-agents#readme",
+  "homepage": "https://github.com/keizman/magpie-grok-bot#readme",
   "bugs": {
-    "url": "https://github.com/guanwenpeng2001-bot/magpie-cloud-agents/issues"
+    "url": "https://github.com/keizman/magpie-grok-bot/issues"
   },
   "magpie": {
     "maxConcurrency": 4,

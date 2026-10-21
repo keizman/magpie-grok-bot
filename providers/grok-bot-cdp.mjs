@@ -1,201 +1,485 @@
-import { createHash } from "node:crypto"
-import { access } from "node:fs/promises"
-import { win32 } from "node:path"
-import { tmpdir } from "node:os"
+import { randomUUID } from "node:crypto"
+import { posix, win32 } from "node:path"
 import { chatError } from "../lib/errors.mjs"
 import { createCdpApp, connectCdp as connectAppCdp } from "../lib/cdp-app.mjs"
+import { sleep } from "../lib/http.mjs"
+import { findExecutable, managedProfileDir, platformOf, stateDir } from "../lib/platform.mjs"
+import { foldPrompt } from "../lib/transcript.mjs"
+import { baseTag, conversationKey, createConversationStore, freshTag, markerOf, parseMarkers, planTurn, recoverFromMarkers, systemTexts, turnHashes, userTexts } from "../lib/conversations.mjs"
 
 export const CDP_ERRORS = {
-  missing: "Grok Bot desktop isn't installed — install it from xAI and sign in once, then retry",
-  signedOut: "Grok Bot isn't signed in in the connected window. Sign in in the Grok Bot window opened by Magpie (or the existing debug-enabled window), then retry. Magpie's separate profile does not inherit your usual app's sign-in; your usual app can stay open.",
+  missing: "Grok Bot desktop isn't installed — install it (macOS: drag Grok Bot.app into /Applications) and retry, or set grokBot.appPath",
+  signedOut: "Grok Bot isn't signed in in the window Magpie opened. Sign in there once, then retry. Magpie's window uses its own profile, so it doesn't share your usual app's sign-in; your usual app can stay open.",
   running: "Magpie couldn't start its own Grok Bot instance — the launch exited before its debug interface opened; retry the sign-in",
-  fallback: "Grok Bot updated and its automation bridge changed — falling back to UI input; if this repeats, the provider needs an update",
-  changed: "Grok Bot changed its UI; the provider needs an update",
+  changed: "Grok Bot changed its UI; the provider needs an update (run scripts/smoke-test.mjs --inspect to see what changed)",
   crashed: "Grok Bot closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
   debug: "Grok Bot didn't open its debug interface — another security tool may be blocking it",
 }
 const failure = key => chatError(key === "signedOut" ? 401 : key === "running" ? 409 : 502, CDP_ERRORS[key])
-export async function findGrokBot({ env = process.env, exists = path => access(path).then(() => true, () => false) } = {}) {
-  const roots = [env.ProgramFiles && win32.join(env.ProgramFiles, "Grok Bot"), env.LOCALAPPDATA && win32.join(env.LOCALAPPDATA, "Programs", "Grok Bot"), ...(env.PATH ?? env.Path ?? "").split(";").filter(Boolean)]
-  for (const root of roots.filter(Boolean)) {
-    const candidate = win32.join(root.replace(/^"|"$/g, ""), "Grok Bot.exe")
-    if (await exists(candidate)) return candidate
-  }
-  throw failure("missing")
-}
-
 export const connectCdp = (url, options, signal) => connectAppCdp(url, { ...options, failure }, signal)
 
+export async function findGrokBot(dependencies = {}, options = {}) {
+  const executable = await findExecutable(dependencies, options)
+  if (!executable) throw failure("missing")
+  return executable
+}
+
+// Selectors for Grok Bot 0.72; each can be overridden with grokBot.selectors.<name> when the app's markup moves.
+export const DEFAULT_SELECTORS = {
+  chat: ".sand-chat",
+  exclude: ".sand-exchange-sheet",
+  row: ".sand-transcript-row",
+  userRow: "[data-role=\"user\"]",
+  assistant: "[data-role=\"assistant\"][role=\"article\"]",
+  prose: ".sand-message-prose",
+  working: ".sand-activity-line, .sand-message-typing, .sand-typing-indicator",
+  busyRow: "[data-pending], [aria-busy=\"true\"]",
+  failedRow: "[data-failed]",
+  composer: "[role=\"textbox\"][contenteditable=\"plaintext-only\"], [role=\"textbox\"][contenteditable=\"true\"], textarea",
+  botItem: "[data-agent-id]",
+  selectedBot: "[data-agent-id][data-selected], [data-agent-id][aria-current=\"page\"]",
+  signIn: "",
+}
+export const BINDING = "__magpieGrokStream"
+// Keeps a background Magpie window rendering at full speed so the reply streams instead of arriving in bursts.
+export const LAUNCH_FLAGS = ["--disable-renderer-backgrounding", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows"]
+
+// Runs inside the app page. Text comes from the React props of each reply (the markdown source as it streams), falling back to the rendered text.
+const PAGE = String.raw`(selectors) => {
+  const VERSION = 3;
+  let S = window.__magpieGrok;
+  if (!S || S.version !== VERSION) {
+    S = { version: VERSION, watchers: new Map() };
+    const all = (root, selector) => { if (!selector) return []; try { return [...root.querySelectorAll(selector)]; } catch { return []; } };
+    const matches = (element, selector) => { if (!selector) return false; try { return element.matches(selector); } catch { return false; } };
+    const text = element => String(element?.innerText ?? element?.textContent ?? "").replace(/\u00a0/g, " ");
+    const visible = element => !!element && element.getClientRects().length > 0;
+    S.source = element => {
+      const key = Object.keys(element).find(name => name.startsWith("__reactFiber$"));
+      let fiber = key ? element[key] : null;
+      for (let depth = 0; fiber && depth < 10; depth++, fiber = fiber.return) {
+        const props = fiber.memoizedProps;
+        if (props && typeof props.content === "string" && "isStreaming" in props) return { text: props.content, streaming: props.isStreaming === true };
+      }
+      return null;
+    };
+    S.chat = () => document.querySelector(S.sel.chat) ?? document.body;
+    S.rows = () => {
+      const chat = S.chat();
+      const rows = all(chat, S.sel.row).filter(row => !(S.sel.exclude && row.closest(S.sel.exclude)) && !row.parentElement?.closest(S.sel.row));
+      return rows.map((row, order) => ({ row, order, index: Number(row.dataset.index) })).sort((a, b) => (Number.isFinite(a.index) && Number.isFinite(b.index) && a.index !== b.index ? a.index - b.index : a.order - b.order)).map(item => item.row);
+    };
+    S.isUser = row => matches(row, S.sel.userRow) || all(row, S.sel.userRow).length > 0;
+    S.selected = () => document.querySelector(S.sel.selectedBot)?.getAttribute("data-agent-id") ?? null;
+    S.read = marker => {
+      const rows = S.rows();
+      const chat = S.chat();
+      let mine = -1;
+      rows.forEach((row, index) => { if (S.isUser(row) && marker && text(row).includes(marker)) mine = index; });
+      const users = rows.filter(S.isUser).map(text).join("\n");
+      const out = { selected: S.selected(), found: mine >= 0, markers: users.match(/\[magpie [0-9a-f]{8}\.\d+\.[0-9a-f]{6}\]/g) ?? [], texts: [], streaming: false, working: false, failed: false, after: 0, userAfter: false, rows: rows.length };
+      if (mine < 0) return out;
+      if (matches(rows[mine], S.sel.busyRow)) out.working = true;
+      if (matches(rows[mine], S.sel.failedRow)) out.failed = true;
+      for (const row of rows.slice(mine + 1)) {
+        if (S.isUser(row)) { out.userAfter = true; break; }
+        out.after++;
+        if (matches(row, S.sel.failedRow)) out.failed = true;
+        if (matches(row, S.sel.busyRow) || all(row, S.sel.working).length) out.working = true;
+        for (const article of all(row, S.sel.assistant)) {
+          const prose = S.sel.prose ? article.querySelector(S.sel.prose) : null;
+          const source = prose ? S.source(prose) : null;
+          if (source?.streaming) out.streaming = true;
+          const value = (source ? source.text : text(prose ?? article)).trim();
+          if (value) out.texts.push(value);
+        }
+      }
+      if (!out.userAfter && all(chat, S.sel.working).some(element => !element.closest(S.sel.row) && visible(element))) out.working = true;
+      return out;
+    };
+    S.bots = () => {
+      const seen = new Map();
+      for (const element of all(document, S.sel.botItem)) {
+        if (element.closest(S.sel.chat)) continue;
+        const id = element.getAttribute("data-agent-id");
+        if (!id || seen.has(id)) continue;
+        const name = (text(element).split("\n").map(line => line.trim()).find(Boolean) || element.getAttribute("aria-label") || id).slice(0, 80);
+        seen.set(id, { id, name, selected: matches(element, S.sel.selectedBot) });
+      }
+      return [...seen.values()];
+    };
+    S.select = (id, click) => {
+      const items = all(document, S.sel.botItem).filter(element => element.getAttribute("data-agent-id") === id && !element.closest(S.sel.chat));
+      if (!items.length) return { ok: false, reason: "missing" };
+      if (items.some(element => matches(element, S.sel.selectedBot))) return { ok: true, selected: true };
+      if (!click) return { ok: true, selected: false };
+      const target = items.find(element => matches(element, "button, a, [role=button], [role=link], [role=option], [role=treeitem]")) ?? items[0];
+      target.scrollIntoView?.({ block: "nearest" });
+      target.click();
+      return { ok: true, selected: false };
+    };
+    S.composer = () => all(document, S.sel.composer).find(visible) ?? null;
+    S.focus = () => {
+      const composer = S.composer();
+      if (!composer) return { ok: false };
+      composer.focus();
+      if (composer.isContentEditable) {
+        const range = document.createRange();
+        range.selectNodeContents(composer);
+        const selection = getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } else composer.select?.();
+      return { ok: document.activeElement === composer || composer.contains(document.activeElement), text: composer.value ?? text(composer) };
+    };
+    S.draft = () => { const composer = S.composer(); return composer ? String(composer.value ?? text(composer)) : null; };
+    S.signedOut = () => !!(S.sel.signIn && document.querySelector(S.sel.signIn));
+    S.watch = (id, marker, binding) => {
+      S.unwatch(id);
+      let last = "", queued = false, ranAt = 0, timer = null;
+      const push = () => {
+        queued = false; timer = null; ranAt = Date.now();
+        let payload;
+        try { payload = JSON.stringify({ id, snapshot: S.read(marker) }); } catch (error) { payload = JSON.stringify({ id, error: String(error?.message ?? error) }); }
+        if (payload === last) return;
+        last = payload;
+        try { window[binding](payload); } catch {}
+      };
+      const schedule = () => {
+        if (queued) return;
+        queued = true;
+        const wait = 40 - (Date.now() - ranAt);
+        if (wait <= 0) queueMicrotask(push); else timer = setTimeout(push, wait);
+      };
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["data-pending", "aria-busy", "data-failed", "data-selected", "aria-current", "data-index", "class"] });
+      S.watchers.set(id, () => { observer.disconnect(); if (timer) clearTimeout(timer); });
+      schedule();
+      return true;
+    };
+    S.unwatch = id => { S.watchers.get(id)?.(); S.watchers.delete(id); return true; };
+    // Markup skeleton for tuning selectors: tags, classes and data attributes only, never text.
+    S.inspect = () => {
+      const skeleton = (element, depth) => ({
+        tag: element.tagName.toLowerCase(),
+        class: String(element.className?.baseVal ?? element.className ?? "").split(/\s+/).filter(name => name && !/^sand-[0-9a-z]{5,8}$/.test(name)).join(" "),
+        attributes: Object.fromEntries([...element.attributes].filter(attribute => /^(data-|role$|aria-(busy|current|label)$|contenteditable$)/.test(attribute.name)).map(attribute => [attribute.name, attribute.name === "aria-label" ? "…" : attribute.value.slice(0, 40)])),
+        children: depth > 0 ? [...element.children].slice(0, 8).map(child => skeleton(child, depth - 1)) : element.children.length,
+      });
+      const counts = Object.fromEntries(Object.entries(S.sel).map(([key, selector]) => [key, all(document, selector).length]));
+      const rows = S.rows();
+      const replies = all(S.chat(), S.sel.assistant).map(article => { const prose = S.sel.prose ? article.querySelector(S.sel.prose) : null; const source = prose ? S.source(prose) : null; return { prose: !!prose, reactSource: !!source, streaming: source?.streaming ?? null, length: (source?.text ?? text(article)).length }; });
+      return { counts, rows: rows.length, lastRows: rows.slice(-4).map(row => skeleton(row, 4)), replies: replies.slice(-4), composer: S.composer() ? skeleton(S.composer(), 0) : null };
+    };
+    window.__magpieGrok = S;
+  }
+  S.sel = selectors;
+  return S;
+}`
+
+const authProbe = `(async () => {
+  const main = window.desktop?.main;
+  if (typeof main?.getCursorAuthStatus === "function") {
+    try { const status = await main.getCursorAuthStatus(); if (typeof status?.kind === "string") return status.kind === "logged-in"; } catch {}
+  }
+  let legacy = null;
+  try { legacy = await window.desktop?.cursorAccount?.getStatus?.(); } catch {}
+  for (const key of ["signedIn", "isSignedIn", "authenticated"]) if (typeof legacy?.[key] === "boolean") return legacy[key];
+  const text = document.body?.innerText ?? "";
+  return !(/sign in|log in/i.test(text) && !/sign out|log out/i.test(text));
+})()`
+const botApis = `(async () => {
+  const main = window.desktop?.main ?? {};
+  const legacy = window.desktop?.agent ?? {};
+  const calls = [main.getHostPinnedAgents, main.getServerPinnedAgents, main.listGrokBotTeamAgents, legacy.getPinnedAgents].map((method, index) => typeof method === "function" ? method.call(index < 3 ? main : legacy) : null);
+  const rows = await Promise.allSettled(calls);
+  return rows.map(row => row.status === "fulfilled" ? row.value : null);
+})()`
 const botList = value => {
-  const list = Array.isArray(value) ? value : value?.agents ?? value?.agentIds ?? value?.pinnedAgents ?? []
+  const list = Array.isArray(value) ? value : value?.agents ?? value?.agentIds ?? value?.pinnedAgentIds ?? value?.pinnedAgents ?? []
   return Array.isArray(list) ? list.flatMap(row => {
     const id = typeof row === "string" ? row : row?.agentId ?? row?.agent_id ?? row?.id
-    return typeof id === "string" && id ? [{ id, name: row?.name ?? row?.title ?? id, markSvgDataUrl: row?.markSvgDataUrl ?? "" }] : []
+    return typeof id === "string" && id ? [{ id, name: typeof row === "object" ? row?.name ?? row?.displayName ?? row?.title : undefined }] : []
   }) : []
 }
-const entriesOf = value => {
-  const entries = Array.isArray(value) ? value : value?.entries ?? value?.tail?.entries
-  if (!Array.isArray(entries)) throw failure("changed")
-  return entries.map(entry => {
-    let body = entry.body ?? entry.payload ?? entry
-    if (typeof body === "string") { try { body = JSON.parse(body) } catch { body = { text: body } } }
-    return { id: String(entry.messageId ?? entry.message_id ?? entry.id ?? entry.seq ?? entry.sequence ?? ""), role: String(entry.role ?? body.role ?? entry.type ?? body.type ?? "").toLowerCase(), text: typeof body.content === "string" ? body.content : String(body.text ?? entry.text ?? "") }
-  })
-}
-const probe = `(async () => {
-  const status = await window.desktop?.cursorAccount?.getStatus?.();
-  if (typeof status?.signedIn === "boolean") return status.signedIn;
-  if (typeof status?.isSignedIn === "boolean") return status.isSignedIn;
-  if (typeof status?.authenticated === "boolean") return status.authenticated;
-  const text = document.body.innerText;
-  if (/sign in|log in/i.test(text) && !/sign out|log out/i.test(text)) return false;
-  try { const pinned = await window.desktop.agent.getPinnedAgents(); return Array.isArray(pinned) || Array.isArray(pinned?.agents) || Array.isArray(pinned?.agentIds); } catch { return false; }
-})()`
-const domTail = `(() => {
-  const region = document.querySelector('[data-testid="transcript"], [role="log"], [class*="transcript" i]');
-  if (!region) throw new Error("transcript region missing");
-  return { entries: [...region.querySelectorAll('[data-message-role], [data-role], [data-testid="assistant-message"], [data-testid="user-message"]')].map(el => ({ id: el.dataset.messageId || el.id, role: el.dataset.messageRole || el.dataset.role || (el.dataset.testid === "assistant-message" ? "assistant" : "user"), text: el.innerText })) };
-})()`
+
+const DEFAULTS = { settleMs: 1500, stuckMs: 120000, emptyMs: 20000, sentMs: 8000, selectMs: 8000, streamPollMs: 150 }
 
 export function createGrokBotCdp(options = {}, dependencies = options.dependencies ?? {}) {
   const active = new Map()
+  let creating = false
+  const selectors = { ...DEFAULT_SELECTORS, ...Object.fromEntries(Object.entries(options.selectors ?? {}).filter(([, value]) => typeof value === "string")) }
+  const setting = key => Number.isFinite(options[key]) && options[key] >= 0 ? options[key] : DEFAULTS[key]
   const app = createCdpApp({
-    failure, find: findGrokBot, processName: "Grok Bot.exe", flag: "magpie-grok-managed",
+    failure, flag: "magpie-grok-managed", boot: true, notReady: "debug", authorizeLaunch: true,
+    find: deps => findGrokBot(deps, options),
+    probe: `(() => { if (!window.desktop?.main && !window.desktop?.agent) throw new Error("bridge not ready"); return document.readyState !== "loading"; })()`,
     version: value => /GrokBot\//.test(value["User-Agent"] ?? ""),
     pages: list => list.filter(target => target.type === "page" && /^file:\/\//.test(target.url ?? "") && /\/dist\/renderer\//.test(target.url ?? "") && /app\.asar/.test(target.url ?? "")),
-    args: deps => ["--user-data-dir=" + win32.join(deps.env.LOCALAPPDATA || tmpdir(), "Magpie", "grok-bot-managed-profile")],
+    args: deps => [`--user-data-dir=${managedProfileDir(deps, options)}`, ...LAUNCH_FLAGS],
     launchError: ({ child, previous }) => failure(previous.length && child.exitCode != null ? "running" : "debug"),
   }, options, dependencies, active)
   const { touch, idle, ensure, checkDrivable } = app
+  const deps = app.deps
+  const now = () => deps.timers.now()
+  const wait = (milliseconds, signal) => sleep(milliseconds, signal, deps.timers)
+  const pathApi = platformOf(deps) === "win32" ? win32 : posix
+  const store = dependencies.store ?? createConversationStore({ file: pathApi.join(stateDir(deps, options), "conversations.json"), persist: options.persistSessions !== false, now })
+  const prepared = new WeakSet()
+
+  const page = (client, call, signal) => client.evaluate(`(${PAGE})(${JSON.stringify(selectors)}).${call}`, signal)
+  async function prepare(client, signal) {
+    if (prepared.has(client)) return
+    prepared.add(client)
+    try { await client.call("Emulation.setFocusEmulationEnabled", { enabled: true }, signal) } catch { signal?.throwIfAborted() }
+    try { await client.call("Runtime.addBinding", { name: BINDING }, signal); client.bound = true } catch { signal?.throwIfAborted(); client.bound = false }
+  }
+  async function connect(signal) {
+    const client = await ensure(signal)
+    await prepare(client, signal)
+    return client
+  }
   function release(run) {
     run.signal?.removeEventListener("abort", run.onAbort)
     if (active.get(run.bot.id) === run) active.delete(run.bot.id)
   }
   async function signedIn(client, signal) {
-    try { if (!await client.evaluate(probe, signal)) throw failure("signedOut") }
+    let value
+    try { value = await client.evaluate(authProbe, signal) }
     catch (error) { signal?.throwIfAborted(); if (error.bridge) throw failure("changed"); throw error }
+    if (!value) throw failure("signedOut")
+    if (selectors.signIn && await page(client, "signedOut()", signal)) throw failure("signedOut")
   }
   async function bots(client, signal) {
-    const value = await client.evaluate(`(async () => { const agent = window.desktop.agent; const rows = await Promise.allSettled([agent.getPinnedAgents(), agent.listGrokBotTeamAgents?.({})]); return rows.map(row => row.status === "fulfilled" ? row.value : null); })()`, signal)
-    return [...new Map((Array.isArray(value) ? value : [value]).flatMap(botList).map(bot => [bot.id, bot])).values()]
+    const fromDom = await page(client, "bots()", signal).catch(() => [])
+    const fromApi = await client.evaluate(botApis, signal).catch(() => [])
+    const merged = new Map()
+    for (const bot of [...(Array.isArray(fromApi) ? fromApi : []).flatMap(botList), ...(Array.isArray(fromDom) ? fromDom : [])]) {
+      const previous = merged.get(bot.id)
+      merged.set(bot.id, { id: bot.id, name: bot.name || previous?.name || bot.id, selected: !!(bot.selected || previous?.selected) })
+    }
+    return [...merged.values()]
   }
-  async function tail(client, agentId, signal) {
-    try { return entriesOf(await client.evaluate(`window.desktop.agent.readTranscriptStoreTail(${JSON.stringify({ agentId, limit: 50, reason: "server-tail" })})`, signal)) }
-    catch (error) {
-      if (!error.bridge) throw error
-      if (!/invalid-args/.test(error.message)) throw failure("changed")
-      try { return entriesOf(await client.evaluate(domTail, signal)) }
-      catch (fallback) { if (!client.open) throw failure("crashed"); throw failure("changed") }
+  async function select(client, bot, signal) {
+    const deadline = now() + setting("selectMs")
+    for (let attempt = 0; ; attempt++) {
+      const result = await page(client, `select(${JSON.stringify(bot.id)}, ${attempt % 20 === 0})`, signal)
+      if (!result?.ok) throw chatError(400, `Grok Bot has no bot "${bot.name ?? bot.id}" in its sidebar — pin it in the app or pick another model`)
+      if (result.selected && await page(client, "composer() !== null", signal)) return
+      if (now() >= deadline) throw failure("changed")
+      await wait(150, signal)
     }
   }
-  async function send(client, bot, prompt, signal) {
-    try {
-      await client.evaluate(`window.desktopMount.mount(${JSON.stringify({ agentId: bot.id, name: bot.name, markSvgDataUrl: bot.markSvgDataUrl ?? "" })})`, signal)
-    } catch (error) {
-      if (!error.bridge) throw error
-      return uiSend(client, bot, prompt, signal)
-    }
-    try { await client.evaluate(`window.desktopMount.submitPrompt(${JSON.stringify({ prompt })})`, signal) }
-    catch (error) {
-      // A lost response may have submitted already; only contract failures can safely retry input.
-      if (!error.bridge) throw error
-      if (!/invalid-args|not a function|not mounted|undefined/.test(error.message)) throw failure("changed")
-      return uiSend(client, bot, prompt, signal)
-    }
-    return ""
+  async function read(client, run, signal) {
+    try { return await page(client, `read(${JSON.stringify(run.marker)})`, signal) }
+    catch (error) { signal?.throwIfAborted(); if (!client.open) throw failure("crashed"); if (error.bridge) throw failure("changed"); throw error }
   }
-  async function uiSend(client, bot, prompt, signal) {
-    try {
-      await client.evaluate(`window.desktopMount.switchTo(${JSON.stringify({ agentId: bot.id })})`, signal)
-      const ready = await client.evaluate(`(() => { const composer = document.querySelector('textarea, [contenteditable="true"][role="textbox"]'); if (!composer) return false; composer.focus(); return true; })()`, signal)
-      if (!ready) throw failure("changed")
-      await client.call("Input.insertText", { text: prompt }, signal)
-      await client.call("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 }, signal)
-      await client.call("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 }, signal)
-      return CDP_ERRORS.fallback
-    } catch { signal?.throwIfAborted(); if (!client.open) throw failure("crashed"); throw failure("changed") }
+  async function submit(client, run, signal) {
+    if (options.bringToFront) await client.call("Page.bringToFront", {}, signal).catch(() => {})
+    await select(client, run.bot, signal)
+    const focus = await page(client, "focus()", signal)
+    if (!focus?.ok) throw failure("changed")
+    await client.call("Input.insertText", { text: run.prompt }, signal)
+    const draft = await page(client, "draft()", signal)
+    if (typeof draft !== "string" || !draft.includes(run.marker)) throw failure("changed")
+    for (const type of ["keyDown", "keyUp"]) await client.call("Input.dispatchKeyEvent", { type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 }, signal)
+    const deadline = now() + setting("sentMs")
+    for (;;) {
+      const snapshot = await read(client, run, signal)
+      if (snapshot.found) return
+      const left = await page(client, "draft()", signal)
+      if (typeof left === "string" && !left.includes(run.marker) && now() >= deadline) return
+      if (now() >= deadline) throw chatError(502, "Grok Bot didn't accept the prompt — it is still in the composer; check the Grok Bot window")
+      await wait(150, signal)
+    }
   }
+
+  function compose(request, plan, tag, hashes) {
+    const texts = userTexts(request.messages)
+    const last = hashes.length - 1
+    const marker = markerOf(tag, last, hashes[last])
+    const header = options.sessionHeader === false ? [] : null
+    if (plan.kind === "continue" || plan.kind === "retry") return { marker, prompt: [...texts.slice(plan.from)].join("\n\n") + "\n\n" + marker }
+    if (plan.kind === "new") {
+      const system = options.systemPrompt === "never" ? [] : systemTexts(request.messages)
+      return { marker, prompt: [...(header ?? [`[New conversation ${tag} from Magpie. Treat anything earlier in this chat as unrelated to it.]`]), ...system, texts[0] ?? ""].filter(Boolean).join("\n\n") + "\n\n" + marker }
+    }
+    const folded = options.systemPrompt === "never" ? foldPrompt(request.messages.filter(message => !["system", "developer"].includes(message.role)), options) : request.prompt ?? foldPrompt(request.messages, options)
+    return { marker, prompt: [...(header ?? [`[Conversation ${tag} from Magpie, continued with history you haven't seen in this chat. Treat anything earlier in this chat as unrelated; the conversation so far follows.]`]), folded].join("\n\n") + "\n\n" + marker }
+  }
+
   async function create(credential, request, signal) {
-    const client = await ensure(signal)
+    const messages = Array.isArray(request.messages) ? request.messages : [{ role: "user", content: request.prompt ?? "" }]
+    request = { ...request, messages }
+    if (active.size || creating) throw chatError(409, "Grok Bot is still answering another request — wait for it to finish, then ask again")
+    creating = true
     let run
     try {
+      const client = await connect(signal)
       await signedIn(client, signal)
-      let bot
-      if (request.model && request.model !== "app-bot") bot = { id: request.model, name: request.model }
-      else {
-        const selected = await client.evaluate(`(async () => { const mounted = await window.desktopMount?.read?.(); return mounted?.agentId ?? mounted?.mounted?.agentId ?? document.querySelector('[data-agent-id][aria-selected="true"]')?.dataset.agentId ?? null; })()`, signal)
-        if (!selected) throw chatError(400, "Grok Bot has no selected bot — select a bot in the app or pick a named bot model")
-        bot = { id: selected, name: selected }
+      const session = request.identity?.sessionKey ?? ""
+      const key = conversationKey({ session, messages, model: request.model })
+      const hashes = turnHashes(messages)
+      if (!hashes.length) throw chatError(400, "Grok Bot needs a user message")
+      const explicit = request.model && request.model !== "app-bot" ? request.model : null
+      let plan = planTurn(store.get(key), hashes, { bot: explicit, explicitBot: !!explicit })
+      let bot = explicit ?? plan.segment?.bot
+      if (!bot) {
+        bot = await page(client, "selected()", signal)
+        if (!bot) throw chatError(400, "Grok Bot has no selected bot — select a bot in the Grok Bot window or pick a named bot model")
       }
-      if (active.has(bot.id)) throw chatError(409, "Grok Bot already has an active turn for this bot — wait for its answer before sending another")
-      const turnIndex = request.identity?.turnIndex ?? request.turnIndex ?? 0
-      const sessionKey = request.identity?.sessionKey ?? request.sessionKey ?? ""
-      const messageId = createHash("sha256").update(JSON.stringify([bot.id, sessionKey, turnIndex, request.prompt])).digest("hex").slice(0, 24)
-      run = { ref: bot.id, view: bot.name, bot, messageId, turnIndex, sessionKey, prompt: `${request.prompt}\n\n[Magpie turn: ${messageId}]`, baseline: [], lastTail: null, signal }
+      const names = await bots(client, signal).catch(() => [])
+      const known = names.find(row => row.id === bot)
+      run = { id: randomUUID(), bot: { id: bot, name: known?.name ?? bot }, key, hashes, signal }
       run.onAbort = () => { release(run); idle() }
-      active.set(bot.id, run)
-    } catch (error) { if (error.bridge) throw failure("changed"); throw error }
-    finally { idle() }
-    signal?.addEventListener("abort", run.onAbort, { once: true })
-    try { signal?.throwIfAborted(); run.baseline = await tail(client, run.bot.id, signal); if (!run.baseline.some(entry => entry.role === "user" && entry.text.includes(`[Magpie turn: ${run.messageId}]`))) run.progress = await send(client, run.bot, run.prompt, signal) }
-    catch (error) { release(run); throw error }
-    finally { idle() }
-    return run
+      active.set(bot, run)
+      signal?.addEventListener("abort", run.onAbort, { once: true })
+      await select(client, run.bot, signal)
+      if (session && plan.kind !== "continue" && plan.kind !== "retry") {
+        const snapshot = await read(client, { marker: "" }, signal)
+        plan = recoverFromMarkers(parseMarkers(snapshot.markers ?? []), baseTag(key), hashes) ?? plan
+      }
+      const segment = plan.segment
+      const tag = segment?.tag ?? (session && !store.get(key)?.segments?.some(row => row.tag === baseTag(key)) ? baseTag(key) : freshTag())
+      Object.assign(run, compose(request, plan, tag, hashes), { tag, plan: plan.kind, ref: `${run.bot.name} · ${plan.kind} ${tag}` })
+      const snapshot = await read(client, run, signal)
+      if (snapshot.found) run.reattached = true
+      else await submit(client, run, signal)
+      run.sentAt = now()
+      run.changedAt = run.sentAt
+      run.busyAt = run.sentAt
+      run.lastText = ""
+      store.record(key, { bot, tag, turns: hashes })
+      return run
+    } catch (error) {
+      if (run) release(run)
+      signal?.throwIfAborted()
+      if (error.bridge) throw failure("changed")
+      throw error
+    } finally { creating = false; idle() }
   }
+
+  function judge(run, snapshot) {
+    const at = now()
+    if (snapshot.selected && snapshot.selected !== run.bot.id) return { state: "running", reselect: true, progress: `switching back to ${run.bot.name}` }
+    const text = (snapshot.texts ?? []).join("\n\n")
+    if (text !== run.lastText) { run.lastText = text; run.changedAt = at }
+    const busy = !!(snapshot.working || snapshot.streaming)
+    if (busy) run.busyAt = at
+    const quiet = at - run.changedAt
+    if (!snapshot.found) return { state: "running", progress: `waiting for ${run.bot.name} to show the prompt` }
+    if (snapshot.failed && !busy && quiet >= setting("settleMs")) return { state: "failed", text: text || "Grok Bot marked the reply as failed" }
+    if (text && snapshot.userAfter) return { state: "succeeded", text }
+    if (text && !busy && quiet >= setting("settleMs")) return { state: "succeeded", text }
+    if (text && !busy) return { state: "running", settleIn: setting("settleMs") - quiet + 5, progress: `${run.bot.name} is finishing` }
+    if (text && busy && quiet >= setting("stuckMs")) return { state: "succeeded", text }
+    if (!text && !busy && snapshot.after > 0 && at - run.busyAt >= setting("emptyMs") && quiet >= setting("emptyMs")) return { state: "succeeded", text: "" }
+    return { state: "running", progress: busy ? (text ? `${run.bot.name} is writing` : `${run.bot.name} is working`) : `waiting for ${run.bot.name}` }
+  }
+  const finish = (run, verdict) => {
+    if (verdict.state === "running") return verdict
+    release(run)
+    return { state: verdict.state, text: verdict.text, streamText: verdict.text, progress: verdict.text }
+  }
+
+  async function stream(credential, run, onEvent, signal) {
+    touch()
+    const client = await connect(signal)
+    let latest, wake
+    const unsubscribe = client.on?.("Runtime.bindingCalled", ({ name, payload }) => {
+      if (name !== BINDING) return
+      try {
+        const value = JSON.parse(payload)
+        if (value?.id === run.id && value.snapshot) { latest = value.snapshot; wake?.() }
+      } catch {}
+    })
+    let watching = false
+    try {
+      if (client.bound && unsubscribe) watching = await page(client, `watch(${JSON.stringify(run.id)}, ${JSON.stringify(run.marker)}, ${JSON.stringify(BINDING)})`, signal).catch(() => false)
+      const interval = watching ? 1000 : setting("streamPollMs") || DEFAULTS.streamPollMs
+      let lastProgress
+      for (;;) {
+        signal?.throwIfAborted()
+        if (!client.open) throw failure("crashed")
+        const snapshot = latest ?? await read(client, run, signal)
+        latest = undefined
+        const verdict = judge(run, snapshot)
+        if (run.lastText) onEvent({ content: run.lastText })
+        if (verdict.progress && verdict.progress !== lastProgress && verdict.state === "running") { lastProgress = verdict.progress; onEvent({ progress: verdict.progress }) }
+        if (verdict.reselect) await select(client, run.bot, signal)
+        if (verdict.state !== "running") return finish(run, verdict)
+        if (latest) continue
+        await new Promise(resolve => {
+          const timer = deps.timers.setTimeout(done, verdict.settleIn > 0 ? Math.min(interval, verdict.settleIn) : interval)
+          function done() { deps.timers.clearTimeout(timer); signal?.removeEventListener("abort", done); wake = undefined; resolve() }
+          wake = done
+          signal?.addEventListener("abort", done, { once: true })
+        })
+      }
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (error.bridge) throw failure("changed")
+      throw error
+    } finally {
+      unsubscribe?.()
+      if (watching && client.open) void page(client, `unwatch(${JSON.stringify(run.id)})`).catch(() => {})
+      idle()
+    }
+  }
+
   async function poll(credential, run, signal) {
     touch()
-    let client = app.connection
     try {
-      let entries
-      try {
-        if (!client?.open) throw failure("crashed")
-        await signedIn(client, signal)
-        entries = await tail(client, run.bot.id, signal)
-      } catch (error) {
-        if (error.status === 401 || error.bridge || error.message === CDP_ERRORS.changed || signal?.aborted) throw error
+      let client = app.connection
+      if (!client?.open) {
         app.disconnect()
-        try { client = await ensure(signal); await signedIn(client, signal); entries = await tail(client, run.bot.id, signal) }
-        catch (recovery) { if (recovery.status === 401 || recovery.message === CDP_ERRORS.changed || signal?.aborted) throw recovery; throw failure("crashed") }
+        client = await connect(signal)
+        await signedIn(client, signal)
       }
-      const signature = JSON.stringify(entries)
-      const stable = signature === run.lastTail
-      run.lastTail = signature
-      const matches = entries.flatMap((entry, index) => entry.role === "user" && entry.text.includes(`[Magpie turn: ${run.messageId}]`) ? [index] : [])
-      const userIndex = matches.length === 1 ? matches[0] : -1
-      const nextUser = entries.findIndex((entry, index) => index > userIndex && entry.role === "user")
-      const replies = userIndex < 0 ? [] : entries.slice(userIndex + 1, nextUser < 0 ? undefined : nextUser)
-      const last = replies.findLast(entry => ["assistant", "error", "refusal"].includes(entry.role))
-      let running = false
-      try {
-        const value = await client.evaluate(`window.desktop.agent.listGrokBotAgentStatuses(${JSON.stringify({ agentIds: [run.bot.id] })})`, signal)
-        const rows = value?.statuses
-        const row = Array.isArray(rows) && rows.find(row => row?.agentId === run.bot.id)
-        running = row?.status === "running"
-      } catch { signal?.throwIfAborted() }
-      if (last && stable && !running) {
-        release(run)
-        return { state: ["error", "refusal"].includes(last.role) ? "failed" : "succeeded", text: last.text }
-      }
-      return { state: "running", progress: run.progress || `waiting for ${run.bot.name}` }
-    } catch (error) { release(run); throw error }
-    finally { idle() }
+      await prepare(client, signal)
+      const verdict = judge(run, await read(client, run, signal))
+      if (verdict.reselect) await select(client, run.bot, signal)
+      const outcome = finish(run, verdict)
+      return outcome.state === "running" ? { ...outcome, partial: run.lastText || undefined } : outcome
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (error.status === 401 || error.message === CDP_ERRORS.changed) release(run)
+      if (error.bridge) throw failure("changed")
+      throw error
+    } finally { idle() }
   }
+
   return {
     id: "grok-bot", name: "Grok Bot",
     async authorize() {
-      return { url: "", method: "auto", instructions: "Magpie attaches to an available debug-enabled Grok Bot window, or opens its own window with a separate profile when you chat. That profile does not inherit your usual app's sign-in: sign in once in the window Magpie opens, then retry your request. Your usual app can stay open. This setup checks drivability, not account sign-in. Sending a turn brings the app window to the front. No credential leaves the app. A unique Magpie turn identifier is appended to each submitted prompt for reply correlation. If the app status bridge is unavailable or unreadable, a paused answer may be delivered as final after two unchanged transcript reads.", callback: async () => {
+      return { url: "", method: "auto", instructions: "Magpie opens its own Grok Bot window with a separate profile (or attaches to a debug-enabled window you list in grokBot.reattachPorts). Sign in once in that window; your usual Grok Bot can stay open. Each conversation is a tagged segment in the selected bot's chat: Magpie sends only new messages to it, and a short [magpie …] marker is appended to each prompt to match its reply. No credential leaves the app.", callback: async () => {
         try { await checkDrivable(); return { type: "success", refresh: "grok-bot-cdp", access: "app-local", expires: 0, accountId: "grok-bot-cdp", mechanism: "cdp" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
     },
     async liveModels(credential, signal) {
-      try { const client = await ensure(signal); await signedIn(client, signal); return Object.fromEntries((await bots(client, signal)).map(bot => [bot.id, { name: bot.name, tool_call: false }])) }
+      try { const client = await connect(signal); await signedIn(client, signal); return Object.fromEntries((await bots(client, signal)).map(bot => [bot.id, { name: bot.name, tool_call: false }])) }
       catch (error) { if (error.status === 401) throw error; return {} }
       finally { idle() }
     },
-    create, poll,
+    async status(signal) {
+      const client = await connect(signal)
+      try {
+        let signed = true
+        try { await signedIn(client, signal) } catch (error) { if (error.status !== 401) throw error; signed = false }
+        return { signedIn: signed, bots: signed ? await bots(client, signal) : [] }
+      } finally { idle() }
+    },
+    async inspect(signal) {
+      const client = await connect(signal)
+      try {
+        const bridge = await client.evaluate(`({ desktop: Object.keys(window.desktop ?? {}), main: Object.keys(window.desktop?.main ?? {}).filter(name => /agent|auth|pinned|session|transcript|status/i.test(name)).sort(), mount: Object.keys(window.desktopMount ?? {}), legacyAgent: Object.keys(window.desktop?.agent ?? {}).length })`, signal)
+        return { bridge, binding: !!client.bound, page: await page(client, "inspect()", signal) }
+      } finally { idle() }
+    },
+    create, stream, poll,
     cancel(credential, run) { if (active.get(run.bot.id) === run) release(run); idle() },
-    followUp(credential, run, texts, signal) { return create(credential, { model: run.bot.id, prompt: texts.join("\n"), turnIndex: run.turnIndex + 1, sessionKey: run.sessionKey }, signal) },
     dispose: app.dispose,
+    _test: { judge, compose, store, selectors, PAGE },
   }
 }

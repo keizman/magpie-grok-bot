@@ -1,8 +1,3 @@
-import { makeCodexCloud } from "./providers/codex-cloud.mjs"
-import { makeCodexAgents } from "./providers/codex-agents.mjs"
-import { makeCursorCloud } from "./providers/cursor-cloud.mjs"
-import { makeDevinCloud } from "./providers/devin-cloud.mjs"
-import { makeDotsDriver } from "./providers/dots.mjs"
 import { makeGrokBotDriver } from "./providers/grok-bot.mjs"
 
 import { debug } from "./lib/log.mjs"
@@ -16,44 +11,25 @@ function validateOptions(options) {
     if (!Number.isFinite(value) || (zero ? value < 0 : value <= 0) || (integer && !Number.isSafeInteger(value))) invalid(path, `${zero ? "a non-negative" : "a positive"}${integer ? " integer" : " finite number"}`)
   }
   const text = (value, path) => { if (typeof value !== "string" || !value.trim()) invalid(path, "a non-empty string") }
-  const url = (value, path) => {
-    text(value, path)
-    let parsed
-    try { parsed = new URL(value) } catch { invalid(path, "an absolute HTTP(S) URL") }
-    if (!["http:", "https:"].includes(parsed.protocol)) invalid(path, "an absolute HTTP(S) URL")
-  }
+  const boolean = (value, path) => { if (value != null && typeof value !== "boolean") invalid(path, "a boolean") }
   object(options, "options")
-  if (options.progress != null && typeof options.progress !== "boolean") invalid("progress", "a boolean")
+  boolean(options.progress, "progress")
   if (options.maxRunMinutes != null) number(options.maxRunMinutes, "maxRunMinutes")
   if (options.maxPromptBytes != null) number(options.maxPromptBytes, "maxPromptBytes", false, true)
-  for (const name of ["apiBase", "codexCloud", "codexAgents", "cursorCloud", "devinCloud", "dots", "dotsApp", "grokBot"]) {
-    if (options[name] != null) object(options[name], name)
+  if (options.grokBot == null) return
+  object(options.grokBot, "grokBot")
+  const settings = options.grokBot
+  for (const key of ["keepAliveMinutes", "launchTimeoutMs", "appBootMs", "settleMs", "stuckMs", "emptyMs", "sentMs", "selectMs"]) {
+    if (settings[key] != null) number(settings[key], `grokBot.${key}`, true)
   }
-  for (const [provider, base] of Object.entries(options.apiBase ?? {})) { if (base != null) url(base, `apiBase.${provider}`) }
-  if (options.codexCloud?.env != null && typeof options.codexCloud.env !== "string") invalid("codexCloud.env", "a string")
-  if (options.codexCloud?.attempts != null) number(options.codexCloud.attempts, "codexCloud.attempts", false, true)
-  if (options.devinCloud?.maxAcuLimit != null) number(options.devinCloud.maxAcuLimit, "devinCloud.maxAcuLimit", true)
-  if (options.codexAgents?.environment != null) {
-    object(options.codexAgents.environment, "codexAgents.environment")
-    text(options.codexAgents.environment.type, "codexAgents.environment.type")
-  }
-  for (const name of ["dotsApp", "grokBot"]) {
-    const settings = options[name] ?? {}
-    for (const key of ["keepAliveMinutes", "launchTimeoutMs", ...(name === "dotsApp" ? ["appBootMs", "surfaceTimeoutMs", "stableMs", "streamIntervalMs"] : [])]) {
-      if (settings[key] != null) number(settings[key], `${name}.${key}`, key !== "streamIntervalMs")
-    }
-    if (settings.reattachPorts != null && (!Array.isArray(settings.reattachPorts) || settings.reattachPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535))) invalid(`${name}.reattachPorts`, "an array of ports from 1 to 65535")
-  }
-  if (options.grokBot?.ghostMode != null && typeof options.grokBot.ghostMode !== "boolean") invalid("grokBot.ghostMode", "a boolean")
-  const dots = options.dots ?? options
-  const prefix = options.dots ? "dots." : ""
-  if (dots.taskTtlMinutes != null) number(dots.taskTtlMinutes, `${prefix}taskTtlMinutes`)
-  if (options.cursorCloud?.repos != null && !Array.isArray(options.cursorCloud.repos)) invalid("cursorCloud.repos", "an array")
-  if (dots.tunnelCommand && (!Array.isArray(dots.tunnelCommand) || !dots.tunnelCommand.length || dots.tunnelCommand.some(part => typeof part !== "string" || !part))) invalid(`${prefix}tunnelCommand`, "a non-empty argv array of strings")
-  if (dots.publicUrl) {
-    url(dots.publicUrl, `${prefix}publicUrl`)
-    const parsed = new URL(dots.publicUrl)
-    if (parsed.protocol !== "https:" || parsed.origin !== dots.publicUrl) invalid(`${prefix}publicUrl`, "an HTTPS origin without a path")
+  if (settings.streamPollMs != null) number(settings.streamPollMs, "grokBot.streamPollMs")
+  if (settings.reattachPorts != null && (!Array.isArray(settings.reattachPorts) || settings.reattachPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535))) invalid("grokBot.reattachPorts", "an array of ports from 1 to 65535")
+  for (const key of ["ghostMode", "bringToFront", "sessionHeader", "persistSessions"]) boolean(settings[key], `grokBot.${key}`)
+  for (const key of ["appPath", "stateDir", "profileDir"]) if (settings[key] != null) text(settings[key], `grokBot.${key}`)
+  if (settings.systemPrompt != null && !["first", "never"].includes(settings.systemPrompt)) invalid("grokBot.systemPrompt", `"first" or "never"`)
+  if (settings.selectors != null) {
+    object(settings.selectors, "grokBot.selectors")
+    for (const [key, value] of Object.entries(settings.selectors)) if (value != null) text(value, `grokBot.selectors.${key}`)
   }
 }
 
@@ -64,17 +40,12 @@ async function initialize(provider, options, factory) {
     validateOptions(settings)
     return await factory(settings)
   } catch (error) {
-    // Vendor errors can contain credentials or prompts; log only the lifecycle event.
+    // Errors can contain prompts; log only the lifecycle event.
     debug(provider, "startup failed")
     throw error
   }
 }
 
-export async function CodexCloudPlugin(input, options) { return initialize("codex-cloud", options, makeCodexCloud) }
-export async function CodexAgentsPlugin(input, options) { return initialize("codex-agents", options, makeCodexAgents) }
-export async function CursorCloudPlugin(input, options) { return initialize("cursor-cloud", options, makeCursorCloud) }
-export async function DevinCloudPlugin(input, options) { return initialize("devin-cloud", options, makeDevinCloud) }
-export async function DotsPlugin(input, options) { return initialize("dots", options, settings => makeDotsDriver(input, settings)) }
 export async function GrokBotPlugin(input, options) { return initialize("grok-bot", options, settings => makeGrokBotDriver(input, settings)) }
 
 export const _internal = {}
