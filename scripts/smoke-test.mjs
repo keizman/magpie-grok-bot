@@ -5,7 +5,8 @@
 //   node scripts/smoke-test.mjs --bot <id>      use a specific bot (ids are listed at start)
 //   node scripts/smoke-test.mjs --skip-extra    skip the catch-up step
 //   node scripts/smoke-test.mjs --inspect       print bridge names and a text-free markup skeleton, then exit
-//   node scripts/smoke-test.mjs --keep-open     leave Magpie's Grok Bot window running afterwards
+//   node scripts/smoke-test.mjs --keep-open     leave Magpie's managed Grok Bot window running afterwards
+//   node scripts/smoke-test.mjs --managed       use a separate Magpie profile instead of your signed-in app
 //
 // It loads index.mjs the way Magpie does and sends real messages to the bot, printing
 // every streamed chunk with a timestamp. Steps:
@@ -29,7 +30,7 @@ const { createGrokBotCdp } = await import(new URL("providers/grok-bot-cdp.mjs", 
 const { conversationKey } = await import(new URL("lib/conversations.mjs", root).href)
 
 const stateDir = mkdtempSync(join(tmpdir(), "magpie-grok-smoke-"))
-const grokBot = { stateDir, keepAliveMinutes: 30, ...(value("--app") ? { appPath: value("--app") } : {}) }
+const grokBot = { stateDir, keepAliveMinutes: 30, ...(value("--app") ? { appPath: value("--app") } : {}), ...(flag("--managed") ? { profile: "managed" } : {}) }
 const started = Date.now()
 const stamp = () => `[${((Date.now() - started) / 1000).toFixed(3).padStart(8)}s]`
 const log = (...parts) => console.log(stamp(), ...parts)
@@ -39,7 +40,7 @@ const check = (name, ok, detail = "") => { results.push({ name, ok }); log(ok ? 
 const owner = createGrokBotCdp(grokBot)
 let exitCode = 0
 try {
-  log("launching or attaching to Grok Bot (a window opens with Magpie's own profile)…")
+  log(grokBot.profile === "managed" ? "launching or attaching to Magpie's own Grok Bot window (separate profile)…" : "attaching to your Grok Bot (if it's open without its debug interface, it quits and reopens with debugging on)…")
   const flow = await owner.authorize()
   const authorized = await flow.callback()
   if (authorized.type !== "success") throw new Error(authorized.error)

@@ -11,7 +11,7 @@ It is built and tested for **macOS** (Grok Bot 0.72). Windows keeps working with
 ## Requirements
 
 - macOS with **Grok Bot.app** in `/Applications` (or `~/Applications`). Any other location works with the `grokBot.appPath` option.
-- A Grok Bot account. You sign in once in the window Magpie opens (see First run).
+- A Grok Bot account, signed in in the Grok Bot app. Magpie uses that existing sign-in (see First run).
 - Magpie with its plugin host (Bun). The smoke test runs on Node 22 or newer.
 
 ## Install
@@ -42,13 +42,21 @@ To work from a local checkout instead, run `magpie plugin add /absolute/path/to/
 magpie plugin login grok-bot
 ```
 
-Choose **Drive the installed Grok Bot desktop app** (the first method). Magpie opens its **own Grok Bot window**. That window uses a separate profile in `~/Library/Application Support/Magpie/grok-bot-managed-profile`, so your usual Grok Bot can stay open and is never touched.
+Choose **Drive the installed Grok Bot desktop app** (the first method). Magpie drives **your installed Grok Bot with its existing sign-in**; there is nothing extra to sign in to.
 
-1. Sign in in the window Magpie opened. You only do this once, because the profile keeps the sign-in.
-2. Select (or create) the bot you want to talk to in that window's sidebar.
+Magpie talks to the app through its debug interface (CDP), which the app only opens when it is started with `--remote-debugging-port`. So:
+
+- If Grok Bot isn't running, Magpie starts it with the debug interface on.
+- If Grok Bot is already running **without** it (you opened it from the Dock or Finder), Magpie quits it gracefully (like ⌘Q) and reopens it with the debug interface on. This happens once; it stays debug-enabled until you quit it. Set `grokBot.restartApp` to `false` to get an error instead, then quit Grok Bot yourself.
+- If Grok Bot is already running with the debug interface, Magpie attaches to it.
+
+Magpie never quits the app when it is done; Grok Bot stays open as your normal app.
+
+1. Make sure you're signed in in Grok Bot. If not, sign in in its window and retry (a request returns 401 until you do).
+2. Select (or create) the bot you want to talk to in the sidebar.
 3. Chat with the `grok-bot/app-bot` model, or pick a specific bot's model.
 
-If a request returns 401 ("Grok Bot isn't signed in in the window Magpie opened"), finish signing in in that window and ask again. Magpie closes its window after one idle minute (`grokBot.keepAliveMinutes`) and reopens it on the next request, already signed in.
+To keep Magpie away from your everyday window, set `grokBot.profile` to `"managed"`. Magpie then opens its own Grok Bot window with a separate profile in `~/Library/Application Support/Magpie/grok-bot-managed-profile`, which you sign in to once, and closes it after one idle minute (`grokBot.keepAliveMinutes`).
 
 ## How it works
 
@@ -56,7 +64,7 @@ If a request returns 401 ("Grok Bot isn't signed in in the window Magpie opened"
 
 Replies stream **while Grok Bot is still writing**. The driver adds a page binding (`Runtime.addBinding`) and a MutationObserver to the app window. On every change it reads the reply's markdown source from the app's own message component, falling back to the rendered text. It then pushes the cumulative text to Magpie, which emits each new piece as an SSE `content` delta. When bindings are unavailable, the driver polls the page every 150 ms (`grokBot.streamPollMs`) instead. Status lines such as "Alpha is writing" arrive separately as `reasoning_content`.
 
-The reply is complete when Grok Bot shows no typing, activity or streaming indicator and the text has been unchanged for `grokBot.settleMs` (1.5 s). Magpie's own window is launched with background throttling disabled, so a hidden or covered window still streams at full speed.
+The reply is complete when Grok Bot shows no typing, activity or streaming indicator and the text has been unchanged for `grokBot.settleMs` (1.5 s). When Magpie starts the app, it launches it with background throttling disabled, so a hidden or covered window still streams at full speed.
 
 The original Windows-only version of this provider did **not** stream answer text. It sent only progress lines while the bot worked and delivered the whole reply after it finished.
 
@@ -94,19 +102,22 @@ Set options with `magpie plugin options github:keizman/magpie-grok-bot '<json>'`
 | `maxRunMinutes` | `30` | Longest a single reply may take; after that, the request returns 504 and asking again reattaches |
 | `maxPromptBytes` | `262144` | Size cap for catch-up prompts |
 | `grokBot.appPath` | auto | Path to `Grok Bot.app` (or to its executable) |
-| `grokBot.profileDir` | `~/Library/Application Support/Magpie/grok-bot-managed-profile` | Profile for Magpie's own window |
+| `grokBot.profile` | `"app"` | `"app"` drives your installed Grok Bot with its existing sign-in; `"managed"` uses a separate Magpie window and profile |
+| `grokBot.restartApp` | `true` | With `"app"`, quit and reopen a Grok Bot that is running without its debug interface; `false` returns an error instead |
+| `grokBot.quitTimeoutMs` | `15000` | How long to wait for Grok Bot to quit before reopening it |
+| `grokBot.profileDir` | `~/Library/Application Support/Magpie/grok-bot-managed-profile` | Profile for the `"managed"` window (setting it implies `"managed"`) |
 | `grokBot.stateDir` | `~/Library/Application Support/Magpie/grok-bot` | Folder for the conversation store |
 | `grokBot.persistSessions` | `true` | Set to `false` to keep the conversation store in memory only |
 | `grokBot.systemPrompt` | `"first"` | `"first"` sends the system prompt once per conversation; `"never"` doesn't send it |
 | `grokBot.sessionHeader` | `true` | Set to `false` to leave out the "New conversation" header line |
-| `grokBot.keepAliveMinutes` | `1` | Idle minutes before Magpie closes the window it opened |
+| `grokBot.keepAliveMinutes` | `1` | Idle minutes before Magpie disconnects (and, with `"managed"`, closes its window) |
 | `grokBot.launchTimeoutMs` / `grokBot.appBootMs` | `10000` / `15000` | How long launch and page start may take |
 | `grokBot.settleMs` | `1500` | Unchanged-text interval that ends a reply |
 | `grokBot.stuckMs` | `120000` | Ends a reply when the text hasn't changed for this long, even if an activity indicator stays on |
 | `grokBot.emptyMs` | `20000` | Ends a reply that produced no text after this long without activity |
 | `grokBot.streamPollMs` | `150` | Polling interval when bindings are unavailable |
 | `grokBot.reattachPorts` | `[]` | Debug ports of Grok Bot windows you started yourself with `--remote-debugging-port`; Magpie attaches to them instead of launching its own |
-| `grokBot.bringToFront` | `false` | Bring Magpie's Grok Bot window to the front before typing |
+| `grokBot.bringToFront` | `false` | Bring the Grok Bot window to the front before typing |
 | `grokBot.selectors` | built in | CSS selector overrides (`chat`, `row`, `userRow`, `assistant`, `prose`, `working`, `busyRow`, `failedRow`, `composer`, `botItem`, `selectedBot`, `signIn`) for when an app update moves its markup |
 
 Set `MAGPIE_GROK_BOT_DEBUG=1` in Magpie's environment to log plugin startup events. The log holds provider ids and fixed event names only, never prompts or option values.
@@ -122,9 +133,10 @@ node scripts/smoke-test.mjs                 # every step, using the bot selected
 node scripts/smoke-test.mjs --bot <bot-id>  # a specific bot (ids are printed at start)
 node scripts/smoke-test.mjs --skip-extra    # skip the catch-up step
 node scripts/smoke-test.mjs --inspect       # print bridge names and a text-free markup skeleton
+node scripts/smoke-test.mjs --managed       # use a separate Magpie profile instead of your signed-in app
 ```
 
-The script loads `index.mjs` the way Magpie does. It opens (or attaches to) Magpie's Grok Bot window and waits up to five minutes if you still need to sign in. Each streamed chunk is printed with a timestamp. The steps:
+The script loads `index.mjs` the way Magpie does. It attaches to your Grok Bot (quitting and reopening it with the debug interface if needed) and waits up to five minutes if you still need to sign in. Each streamed chunk is printed with a timestamp. The steps:
 
 1. **Session A, turn 1:** "Please remember the number 4721…"
 2. **Session A, turn 2:** "What number did I ask you to remember?" The full history is sent, as Magpie sends it. The step passes if the reply contains 4721 and the conversation store still shows a single segment.
@@ -132,7 +144,7 @@ The script loads `index.mjs` the way Magpie does. It opens (or attaches to) Magp
 4. **Session B:** a new conversation gets its own segment.
 5. **Catch-up:** a conversation with invented earlier history ("My favourite colour is teal") is sent once as a folded prompt, and the reply must say teal.
 
-It ends with a PASS/FAIL summary and exits non-zero if any step fails. Magpie's window closes afterwards; add `--keep-open` to leave it running.
+It ends with a PASS/FAIL summary and exits non-zero if any step fails. Your Grok Bot stays open afterwards. With `--managed`, Magpie's window closes; add `--keep-open` to leave it running.
 
 If a step fails after an app update, run `--inspect` and compare the output with the defaults in `providers/grok-bot-cdp.mjs` (`DEFAULT_SELECTORS`). You can fix most changes without a code change through `grokBot.selectors`.
 
@@ -158,8 +170,8 @@ The unit tests replace the app with an in-memory fake and cover the following:
 
 ## Security notes
 
-- A CDP debug port has no authentication. While it is open, any local program can control the signed-in app. Magpie binds it to `127.0.0.1` only, uses a separate profile, and closes its window after the idle interval. A window you start yourself for `reattachPorts` stays open until you quit it.
-- Magpie stops only processes it started. It confirms a process by its PID, start time, executable and a random launch tag before sending `SIGTERM`.
+- A CDP debug port has no authentication. While it is open, any local program running as you can control the signed-in app. Magpie binds it to `127.0.0.1` only. With the default `"app"` profile, the port stays open until you quit Grok Bot; use `"managed"` if you want it limited to a separate profile that closes after the idle interval.
+- With `"app"`, Magpie quits your Grok Bot only to reopen it with the debug interface, after re-checking its PID and start time, and never on shutdown. With `"managed"`, Magpie stops only processes it started, confirmed by PID, start time, executable and a random launch tag.
 - No Grok Bot credential is read, copied or sent anywhere by the default method. The conversation store holds hashes only.
 
 ## Direct Connect (Windows only, unchanged)
@@ -170,7 +182,7 @@ The second sign-in method, **Direct Connect protocol**, is kept exactly as it wa
 
 1. 把 **Grok Bot.app** 放进 `/Applications`。
 2. 安装插件：`magpie plugin add github:keizman/magpie-grok-bot`。也可以在 `~/.config/magpie/plugins.json` 里加入 `{"plugins":[{"spec":"github:keizman/magpie-grok-bot"}]}`，或者在 Magpie 应用的 **Plugins → Add a plugin** 中添加。
-3. 运行 `magpie plugin login grok-bot`，选择第一种方式。在 Magpie 打开的独立 Grok Bot 窗口里登录一次，并选好要对话的 Bot。
+3. 运行 `magpie plugin login grok-bot`，选择第一种方式。插件直接使用你已经登录的 Grok Bot。如果 Grok Bot 正在运行但没有开启调试接口，插件会正常退出它并带调试接口重新打开（只需一次；设 `grokBot.restartApp: false` 可禁止）。想用独立窗口和独立配置，设 `grokBot.profile: "managed"`。
 4. 回复会在 Grok Bot 生成的同时流式返回。每个 Magpie 会话对应所选 Bot 聊天里的一个带标签的会话段，后续轮次只发送新的用户消息；重启后也能接着之前的会话继续。
 5. 真机验证：`node scripts/smoke-test.mjs`。
 

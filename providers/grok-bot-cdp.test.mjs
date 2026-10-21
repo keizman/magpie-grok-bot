@@ -130,9 +130,10 @@ function fakeApp(settings = {}) {
     platform: "darwin", env: { HOME: "/Users/tester" }, host: new EventEmitter(),
     exists: async path => [BUNDLE, EXECUTABLE].includes(path),
     readFile: async () => PLIST,
-    processes: async () => [], parentAlive: () => true, stopManaged: async () => {}, stopManagedSync() {},
+    processes: async () => (state.processes ?? []).map(row => ({ ...row })), parentAlive: () => true, stopManaged: async () => {}, stopManagedSync() {},
+    stopApp: async row => { (state.stopped ??= []).push(row.pid); state.processes = (state.processes ?? []).filter(current => current.pid !== row.pid || state.stubborn) },
     freePort: async () => 9444,
-    spawn(executable, argv) { state.spawns.push({ executable, argv }); return { pid: 900, exitCode: null, once() {} } },
+    spawn(executable, argv, spawnOptions) { state.spawns.push({ executable, argv, options: spawnOptions }); return { pid: 900, exitCode: null, once() {}, unref() { state.unref = true } } },
     fetch: async url => Response.json(String(url).endsWith("/json/version") ? { "User-Agent": "Mozilla/5.0 GrokBot/0.72.1 Chrome/146 Electron/41" } : [{ type: "page", url: "file:///Applications/Grok%20Bot.app/Contents/Resources/app.asar/dist/renderer/index.html", webSocketDebuggerUrl: "ws://127.0.0.1:9444/devtools/page/1" }]),
     connect: async () => client,
   }
@@ -142,7 +143,7 @@ function fakeApp(settings = {}) {
 function harness(settings = {}, options = {}) {
   const app = fakeApp(settings)
   const dir = mkdtempSync(join(tmpdir(), "grok-cdp-test-"))
-  const grokBot = { settleMs: 40, streamPollMs: 10, stateDir: dir, ...options }
+  const grokBot = { settleMs: 40, streamPollMs: 10, botsMs: 0, stateDir: dir, ...options }
   const make = (overrides = {}) => {
     const plugin = makeGrokBotDriver({}, { grokBot: { ...grokBot, ...overrides } }, { cdp: app.dependencies })
     return plugin
@@ -197,14 +198,77 @@ test("finds the app bundle on macOS through Info.plist", async () => {
   expect(error.status).toBe(502)
 })
 
-test("launches with a separate profile under Application Support and unthrottled rendering", async () => {
+test("by default launches the installed app with its own signed-in profile, detached and unowned", async () => {
   const { app, plugin } = harness()
-  await chat(plugin, [user("hello")])
+  const result = await chat(plugin, [user("hello")])
+  expect(result.error).toBeUndefined()
   const [spawned] = app.state.spawns
   expect(spawned.executable).toBe(EXECUTABLE)
   expect(spawned.argv).toContain("--remote-debugging-address=127.0.0.1")
-  expect(spawned.argv).toContain("--user-data-dir=/Users/tester/Library/Application Support/Magpie/grok-bot-managed-profile")
+  expect(spawned.argv.some(arg => arg.startsWith("--user-data-dir="))).toBe(false)
+  expect(spawned.argv.some(arg => arg.startsWith("--magpie-grok-managed="))).toBe(false)
+  expect(spawned.options.detached).toBe(true)
+  expect(app.state.unref).toBe(true)
   for (const flag of LAUNCH_FLAGS) expect(spawned.argv).toContain(flag)
+})
+
+test("profile \"managed\" launches a separate profile under Application Support", async () => {
+  const { app, plugin } = harness({}, { profile: "managed" })
+  await chat(plugin, [user("hello")])
+  const [spawned] = app.state.spawns
+  expect(spawned.argv).toContain("--user-data-dir=/Users/tester/Library/Application Support/Magpie/grok-bot-managed-profile")
+  expect(spawned.argv.some(arg => arg.startsWith("--magpie-grok-managed="))).toBe(true)
+})
+
+const running = (pid, command) => ({ pid, created: "Tue Oct 21 07:46:00 2026", executable: EXECUTABLE, command, port: Number(command.match(/--remote-debugging-port=(\d+)/)?.[1]) || undefined })
+
+test("attaches to the user's app when it already has a debug port, ignoring Magpie's managed window", async () => {
+  const { app, plugin } = harness({ processes: [
+    running(1, `${EXECUTABLE} --remote-debugging-port=9555 --user-data-dir=/Users/tester/Library/Application Support/Magpie/grok-bot-managed-profile`),
+    running(2, `${EXECUTABLE} --remote-debugging-port=9444`),
+  ] })
+  const ports = []
+  const fetch = app.dependencies.fetch
+  app.dependencies.fetch = async (url, init) => { ports.push(new URL(url).port); return fetch(url, init) }
+  const result = await chat(plugin, [user("hello")])
+  expect(result.error).toBeUndefined()
+  expect(app.state.spawns).toHaveLength(0)
+  expect(ports).not.toContain("9555")
+  expect(app.state.stopped).toBeUndefined()
+})
+
+test("quits a running app that lacks a debug port and reopens it with one", async () => {
+  const { app, plugin } = harness({ processes: [running(7, EXECUTABLE)] }, { relaunchDelayMs: 0 })
+  const result = await chat(plugin, [user("hello")])
+  expect(result.error).toBeUndefined()
+  expect(app.state.stopped).toEqual([7])
+  expect(app.state.spawns).toHaveLength(1)
+})
+
+test("the first bot list on a new connection waits for a freshly booted sidebar to fill in", async () => {
+  const all = [{ id: "bot-a", name: "Alpha" }, { id: "bot-b", name: "Beta" }, { id: "bot-c", name: "Gamma" }]
+  const { app, plugin } = harness({ bots: all.slice(0, 1), selected: null }, { botsMs: 3000 })
+  setTimeout(() => { app.state.bots = all; app.state.selected = "bot-b" }, 500)
+  const config = {}
+  await plugin.config(config)
+  const models = await plugin.provider.models(config.provider["grok-bot"], { auth })
+  expect(Object.keys(models).filter(id => id !== "app-bot").sort()).toEqual(["bot-a", "bot-b", "bot-c"])
+})
+
+test("restartApp false refuses to quit the user's app", async () => {
+  const { app, plugin } = harness({ processes: [running(7, EXECUTABLE)] }, { restartApp: false })
+  const { response } = await chat(plugin, [user("hello")], { stream: false })
+  expect(response.status).toBe(409)
+  expect(app.state.stopped).toBeUndefined()
+  expect(app.state.spawns).toHaveLength(0)
+})
+
+test("an app that won't quit reports how to quit it instead of launching a second copy", async () => {
+  const { app, plugin } = harness({ processes: [running(7, EXECUTABLE)], stubborn: true }, { quitTimeoutMs: 0 })
+  const { response, json } = await chat(plugin, [user("hello")], { stream: false })
+  expect(response.status).toBe(409)
+  expect(JSON.stringify(json)).toContain("didn't quit in time")
+  expect(app.state.spawns).toHaveLength(0)
 })
 
 test("reply content streams as ordered deltas while the bot is still writing", async () => {

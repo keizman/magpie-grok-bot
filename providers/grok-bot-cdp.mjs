@@ -3,19 +3,22 @@ import { posix, win32 } from "node:path"
 import { chatError } from "../lib/errors.mjs"
 import { createCdpApp, connectCdp as connectAppCdp } from "../lib/cdp-app.mjs"
 import { sleep } from "../lib/http.mjs"
-import { findExecutable, managedProfileDir, platformOf, stateDir } from "../lib/platform.mjs"
+import { findExecutable, managedProfileDir, ownsRow, platformOf, stateDir } from "../lib/platform.mjs"
 import { foldPrompt } from "../lib/transcript.mjs"
 import { baseTag, conversationKey, createConversationStore, freshTag, markerOf, parseMarkers, planTurn, recoverFromMarkers, systemTexts, turnHashes, userTexts } from "../lib/conversations.mjs"
 
 export const CDP_ERRORS = {
   missing: "Grok Bot desktop isn't installed — install it (macOS: drag Grok Bot.app into /Applications) and retry, or set grokBot.appPath",
-  signedOut: "Grok Bot isn't signed in in the window Magpie opened. Sign in there once, then retry. Magpie's window uses its own profile, so it doesn't share your usual app's sign-in; your usual app can stay open.",
-  running: "Magpie couldn't start its own Grok Bot instance — the launch exited before its debug interface opened; retry the sign-in",
+  signedOut: "Grok Bot isn't signed in. Sign in in the Grok Bot window, then retry.",
+  running: "Magpie couldn't start Grok Bot — the launch exited before its debug interface opened; quit Grok Bot and retry",
+  busy: "Grok Bot is open without its debug interface and grokBot.restartApp is false. Quit Grok Bot and retry (Magpie reopens it with debugging on), or set grokBot.restartApp to true",
+  quit: "Grok Bot didn't quit in time for Magpie to reopen it with its debug interface. Quit it yourself (on Windows, also from the tray) and retry",
   changed: "Grok Bot changed its UI; the provider needs an update (run scripts/smoke-test.mjs --inspect to see what changed)",
   crashed: "Grok Bot closed mid-answer — your prompt may still be answered in the app; ask again to re-attach",
   debug: "Grok Bot didn't open its debug interface — another security tool may be blocking it",
 }
-const failure = key => chatError(key === "signedOut" ? 401 : key === "running" ? 409 : 502, CDP_ERRORS[key])
+const failure = key => chatError(key === "signedOut" ? 401 : ["running", "busy", "quit"].includes(key) ? 409 : 502, CDP_ERRORS[key])
+export const usesAppProfile = options => (options.profile ?? (options.profileDir ? "managed" : "app")) === "app"
 export const connectCdp = (url, options, signal) => connectAppCdp(url, { ...options, failure }, signal)
 
 export async function findGrokBot(dependencies = {}, options = {}) {
@@ -203,20 +206,23 @@ const botList = value => {
   }) : []
 }
 
-const DEFAULTS = { settleMs: 1500, stuckMs: 120000, emptyMs: 20000, sentMs: 8000, selectMs: 8000, streamPollMs: 150 }
+const DEFAULTS = { settleMs: 1500, stuckMs: 120000, emptyMs: 20000, sentMs: 8000, selectMs: 8000, streamPollMs: 150, botsMs: 5000 }
 
 export function createGrokBotCdp(options = {}, dependencies = options.dependencies ?? {}) {
   const active = new Map()
   let creating = false
   const selectors = { ...DEFAULT_SELECTORS, ...Object.fromEntries(Object.entries(options.selectors ?? {}).filter(([, value]) => typeof value === "string")) }
   const setting = key => Number.isFinite(options[key]) && options[key] >= 0 ? options[key] : DEFAULTS[key]
+  const shared = usesAppProfile(options)
   const app = createCdpApp({
-    failure, flag: "magpie-grok-managed", boot: true, notReady: "debug", authorizeLaunch: true,
+    failure, flag: "magpie-grok-managed", boot: true, notReady: "debug", authorizeLaunch: true, busy: "busy", quitError: "quit",
+    shared: () => shared,
+    owns: (row, deps) => ownsRow(row, { shared, profileDir: managedProfileDir(deps, options), platform: platformOf(deps) }),
     find: deps => findGrokBot(deps, options),
     probe: `(() => { if (!window.desktop?.main && !window.desktop?.agent) throw new Error("bridge not ready"); return document.readyState !== "loading"; })()`,
     version: value => /GrokBot\//.test(value["User-Agent"] ?? ""),
     pages: list => list.filter(target => target.type === "page" && /^file:\/\//.test(target.url ?? "") && /\/dist\/renderer\//.test(target.url ?? "") && /app\.asar/.test(target.url ?? "")),
-    args: deps => [`--user-data-dir=${managedProfileDir(deps, options)}`, ...LAUNCH_FLAGS],
+    args: deps => [...(shared ? [] : [`--user-data-dir=${managedProfileDir(deps, options)}`]), ...LAUNCH_FLAGS],
     launchError: ({ child, previous }) => failure(previous.length && child.exitCode != null ? "running" : "debug"),
   }, options, dependencies, active)
   const { touch, idle, ensure, checkDrivable } = app
@@ -250,7 +256,21 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
     if (!value) throw failure("signedOut")
     if (selectors.signIn && await page(client, "signedOut()", signal)) throw failure("signedOut")
   }
+  // A freshly booted window fills its sidebar over a few seconds, so the first read on a connection waits for the list to settle.
   async function bots(client, signal) {
+    let list = await readBots(client, signal)
+    if (client.botsSettled) return list
+    const deadline = now() + setting("botsMs")
+    for (let previous = ""; now() < deadline; await wait(400, signal)) {
+      const key = list.map(bot => `${bot.id}${bot.selected ? "*" : ""}`).join()
+      if (key && key === previous && list.some(bot => bot.selected)) break
+      previous = key
+      list = await readBots(client, signal)
+    }
+    client.botsSettled = true
+    return list
+  }
+  async function readBots(client, signal) {
     const fromDom = await page(client, "bots()", signal).catch(() => [])
     const fromApi = await client.evaluate(botApis, signal).catch(() => [])
     const merged = new Map()
@@ -324,11 +344,11 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
       const explicit = request.model && request.model !== "app-bot" ? request.model : null
       let plan = planTurn(store.get(key), hashes, { bot: explicit, explicitBot: !!explicit })
       let bot = explicit ?? plan.segment?.bot
+      const names = await bots(client, signal).catch(() => [])
       if (!bot) {
-        bot = await page(client, "selected()", signal)
+        bot = await page(client, "selected()", signal) ?? names.find(row => row.selected)?.id
         if (!bot) throw chatError(400, "Grok Bot has no selected bot — select a bot in the Grok Bot window or pick a named bot model")
       }
-      const names = await bots(client, signal).catch(() => [])
       const known = names.find(row => row.id === bot)
       run = { id: randomUUID(), bot: { id: bot, name: known?.name ?? bot }, key, hashes, signal }
       run.onAbort = () => { release(run); idle() }
@@ -452,7 +472,9 @@ export function createGrokBotCdp(options = {}, dependencies = options.dependenci
   return {
     id: "grok-bot", name: "Grok Bot",
     async authorize() {
-      return { url: "", method: "auto", instructions: "Magpie opens its own Grok Bot window with a separate profile (or attaches to a debug-enabled window you list in grokBot.reattachPorts). Sign in once in that window; your usual Grok Bot can stay open. Each conversation is a tagged segment in the selected bot's chat: Magpie sends only new messages to it, and a short [magpie …] marker is appended to each prompt to match its reply. No credential leaves the app.", callback: async () => {
+      return { url: "", method: "auto", instructions: (shared
+        ? "Magpie uses your installed Grok Bot and its existing sign-in. If Grok Bot is open without its debug interface, Magpie quits it and reopens it with debugging on (set grokBot.restartApp to false to prevent that). Sign in there if you haven't."
+        : "Magpie opens its own Grok Bot window with a separate profile (or attaches to a debug-enabled window you list in grokBot.reattachPorts). Sign in once in that window; your usual Grok Bot can stay open.") + " Each conversation is a tagged segment in the selected bot's chat: Magpie sends only new messages to it, and a short [magpie …] marker is appended to each prompt to match its reply. No credential leaves the app.", callback: async () => {
         try { await checkDrivable(); return { type: "success", refresh: "grok-bot-cdp", access: "app-local", expires: 0, accountId: "grok-bot-cdp", mechanism: "cdp" } }
         catch (error) { return { type: "failed", error: error.message } }
       } }
